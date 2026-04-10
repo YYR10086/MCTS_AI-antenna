@@ -58,10 +58,14 @@ class TestHeteroTurbo(unittest.TestCase):
         X_train = np.vstack([x_left, x_right])
         y_train = np.concatenate([y_left, y_right])
 
-        q_left = np.array([[0.2, 0.2]])
-        q_right = np.array([[0.8, 0.8]])
-        n_left = turbo._estimate_local_noise(X_train, y_train, q_left)[0]
-        n_right = turbo._estimate_local_noise(X_train, y_train, q_right)[0]
+        # 注意：_estimate_local_noise 的归一化是“对本次 query 集合内部”做的，
+        # 因此必须一次性同时传入两侧 query 才能做相对比较。
+        q_left = np.clip(rng.normal(loc=[0.2, 0.2], scale=0.01, size=(8, 2)), 0.0, 1.0)
+        q_right = np.clip(rng.normal(loc=[0.8, 0.8], scale=0.01, size=(8, 2)), 0.0, 1.0)
+        q_all = np.vstack([q_left, q_right])
+        noise_all = turbo._estimate_local_noise(X_train, y_train, q_all)
+        n_left = float(np.mean(noise_all[: len(q_left)]))
+        n_right = float(np.mean(noise_all[len(q_left) :]))
 
         self.assertGreater(
             n_right,
