@@ -223,10 +223,140 @@ def benchmark_task(
     stem = f"{func_name}_d{dim}_s{seed}"
     turbo_ckpt = os.path.join(ckpt_dir, f"{stem}_turbo.pkl")
     gp_ckpt = os.path.join(ckpt_dir, f"{stem}_gpei.pkl")
+    ga_ckpt = os.path.join(ckpt_dir, f"{stem}_ga.pkl")
+    de_ckpt = os.path.join(ckpt_dir, f"{stem}_de.pkl")
 
     X_t, y_t, hist_t = run_turbo(func, lb, ub, iters, seed, turbo_ckpt, resume)
     X_g, y_g, hist_g = run_gp_ei(func, lb, ub, iters, seed, gp_ckpt, resume)
-    return hist_t, hist_g, float(np.min(y_t)), float(np.min(y_g))
+    X_ga, y_ga, hist_ga = run_ga(func, lb, ub, iters, seed, ga_ckpt, resume)
+    X_de, y_de, hist_de = run_de(func, lb, ub, iters, seed, de_ckpt, resume)
+    return (
+        hist_t,
+        hist_g,
+        hist_ga,
+        hist_de,
+        float(np.min(y_t)),
+        float(np.min(y_g)),
+        float(np.min(y_ga)),
+        float(np.min(y_de)),
+    )
+
+
+def run_ga(
+    f: Callable[[np.ndarray], float],
+    lb: np.ndarray,
+    ub: np.ndarray,
+    iters: int,
+    seed: int,
+    checkpoint: str,
+    resume: bool,
+):
+    dim = len(lb)
+    rng = np.random.default_rng(seed)
+    state = load_state(checkpoint) if resume else None
+    pop_size = max(30, 2 * dim)
+
+    if state is None:
+        pop = rng.uniform(lb, ub, size=(pop_size, dim))
+        fit = np.array([f(x) for x in pop], dtype=float)
+        X = np.array(pop, copy=True)
+        y = fit[:, None]
+        best_hist = [float(np.min(fit))] * len(fit)
+    else:
+        X, y, best_hist = state.X, state.y, state.best_hist
+        pop = state.extra["pop"]
+        fit = state.extra["fit"]
+        print(f"[GA] Resume: {os.path.basename(checkpoint)} from iter={len(y)}")
+
+    try:
+        while len(y) < iters:
+            idx = rng.choice(pop_size, size=4, replace=False)
+            p1, p2 = pop[idx[0]], pop[idx[1]]
+            # BLX-like crossover
+            alpha = rng.uniform(0.2, 0.8)
+            child = alpha * p1 + (1 - alpha) * p2
+            # Gaussian mutation
+            mut_sigma = 0.08 * (ub - lb)
+            mask = rng.random(dim) < max(0.1, 2.0 / dim)
+            child[mask] += rng.normal(0.0, mut_sigma[mask], size=np.sum(mask))
+            child = np.clip(child, lb, ub)
+            f_child = f(child)
+
+            worst = int(np.argmax(fit))
+            if f_child < fit[worst]:
+                pop[worst] = child
+                fit[worst] = f_child
+
+            X = np.vstack([X, child[None, :]])
+            y = np.vstack([y, [[f_child]]])
+            best_hist.append(float(np.min(y)))
+            save_state(
+                checkpoint,
+                RunState(X=X, y=y, best_hist=best_hist, extra={"pop": pop, "fit": fit}),
+            )
+            print(f"[GA] {os.path.basename(checkpoint)} iter={len(y):03d} best={best_hist[-1]:.6f}")
+    except KeyboardInterrupt:
+        print(f"\n[GA] Interrupted: {checkpoint}")
+
+    return X, y, best_hist
+
+
+def run_de(
+    f: Callable[[np.ndarray], float],
+    lb: np.ndarray,
+    ub: np.ndarray,
+    iters: int,
+    seed: int,
+    checkpoint: str,
+    resume: bool,
+):
+    dim = len(lb)
+    rng = np.random.default_rng(seed)
+    state = load_state(checkpoint) if resume else None
+    pop_size = max(30, 2 * dim)
+    F = 0.6
+    CR = 0.9
+
+    if state is None:
+        pop = rng.uniform(lb, ub, size=(pop_size, dim))
+        fit = np.array([f(x) for x in pop], dtype=float)
+        X = np.array(pop, copy=True)
+        y = fit[:, None]
+        best_hist = [float(np.min(fit))] * len(fit)
+    else:
+        X, y, best_hist = state.X, state.y, state.best_hist
+        pop = state.extra["pop"]
+        fit = state.extra["fit"]
+        print(f"[DE] Resume: {os.path.basename(checkpoint)} from iter={len(y)}")
+
+    try:
+        while len(y) < iters:
+            i = int(rng.integers(pop_size))
+            candidates = [j for j in range(pop_size) if j != i]
+            a, b, c = rng.choice(candidates, size=3, replace=False)
+            mutant = pop[a] + F * (pop[b] - pop[c])
+            mutant = np.clip(mutant, lb, ub)
+            cross = rng.random(dim) < CR
+            if not np.any(cross):
+                cross[int(rng.integers(dim))] = True
+            trial = np.where(cross, mutant, pop[i])
+            f_trial = f(trial)
+            if f_trial < fit[i]:
+                pop[i] = trial
+                fit[i] = f_trial
+
+            X = np.vstack([X, trial[None, :]])
+            y = np.vstack([y, [[f_trial]]])
+            best_hist.append(float(np.min(y)))
+            save_state(
+                checkpoint,
+                RunState(X=X, y=y, best_hist=best_hist, extra={"pop": pop, "fit": fit}),
+            )
+            print(f"[DE] {os.path.basename(checkpoint)} iter={len(y):03d} best={best_hist[-1]:.6f}")
+    except KeyboardInterrupt:
+        print(f"\n[DE] Interrupted: {checkpoint}")
+
+    return X, y, best_hist
 
 
 def plot_grid(results, out_png):
@@ -241,8 +371,12 @@ def plot_grid(results, out_png):
             r = results[(fn, d)]
             xt = np.arange(1, len(r["turbo_hist"]) + 1)
             xg = np.arange(1, len(r["gp_hist"]) + 1)
+            xga = np.arange(1, len(r["ga_hist"]) + 1)
+            xde = np.arange(1, len(r["de_hist"]) + 1)
             ax.plot(xt, r["turbo_hist"], label="TuRBO(hetero)", linewidth=1.8)
             ax.plot(xg, r["gp_hist"], label="GP+EI", linewidth=1.8)
+            ax.plot(xga, r["ga_hist"], label="GA", linewidth=1.6)
+            ax.plot(xde, r["de_hist"], label="DE", linewidth=1.6)
             ax.set_title(f"{fn.upper()}  dim={d}")
             ax.set_xlabel("iter")
             ax.set_ylabel("best")
@@ -264,8 +398,8 @@ def main():
     args = parser.parse_args()
 
     tasks = {
-        "ackley": (ackley, (-5.0, 5.0)),
-        "f4": (f4_rosen_log, (-3.0, 3.0)),
+        "ackley": (ackley, (-5.0, 10.0)),
+        "f4": (f4_rosen_log, (-5.0, 10.0)),
     }
     dims = [10, 20, 50]
 
@@ -274,7 +408,7 @@ def main():
         for d in dims:
             print("\n" + "=" * 70)
             print(f"Task: {fn_name} | dim={d} | iters={args.iters}")
-            hist_t, hist_g, best_t, best_g = benchmark_task(
+            hist_t, hist_g, hist_ga, hist_de, best_t, best_g, best_ga, best_de = benchmark_task(
                 func_name=fn_name,
                 dim=d,
                 func=fn,
@@ -287,10 +421,17 @@ def main():
             results[(fn_name, d)] = {
                 "turbo_hist": hist_t,
                 "gp_hist": hist_g,
+                "ga_hist": hist_ga,
+                "de_hist": hist_de,
                 "best_turbo": best_t,
                 "best_gp": best_g,
+                "best_ga": best_ga,
+                "best_de": best_de,
             }
-            print(f"[Result] {fn_name} d={d}: TuRBO={best_t:.6f}, GP+EI={best_g:.6f}")
+            print(
+                f"[Result] {fn_name} d={d}: "
+                f"TuRBO={best_t:.6f}, GP+EI={best_g:.6f}, GA={best_ga:.6f}, DE={best_de:.6f}"
+            )
 
     plot_grid(results, args.out)
     print("\nDone.")
