@@ -21,6 +21,14 @@ original_read_config = SpacePartitioningOptimizer._read_config
 def patched_read_config(self):
     conf = original_read_config(self)
     conf["reset_no_improvement"] = 1000000
+    conf["n_init_points"] = 6  # 3D 参数空间里更快进入模型阶段
+    conf["turbo_training_steps"] = 80
+    conf["turbo"]["budget"] = 20
+    conf["turbo"]["use_hetero_lcb"] = 1
+    conf["turbo"]["hetero_beta0"] = 2.2
+    conf["turbo"]["hetero_beta1"] = 0.8
+    conf["turbo"]["hetero_noise_penalty"] = 0.35
+    conf["turbo"]["hetero_k_neighbors"] = 6
     conf["debug"] = False
     conf["DEBUG"] = False
     return conf
