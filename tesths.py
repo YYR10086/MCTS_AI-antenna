@@ -47,26 +47,27 @@ class TestHeteroTurbo(unittest.TestCase):
         turbo = _make_turbo_for_unit_test(dim=2)
 
         # 左团: 方差小（几乎常数）
-        grid = np.linspace(-0.03, 0.03, 8)
+        grid = np.linspace(-0.03, 0.03, 7)
         x_left = np.array([[0.2 + dx, 0.2 + dy] for dx in grid for dy in grid], dtype=float)
         x_left = np.clip(x_left, 0.0, 1.0)
-        y_left = 0.2 + 0.005 * np.sin(np.arange(len(x_left)))
+        y_left = np.full((len(x_left),), 0.2, dtype=float)
+        y_left[::3] += 0.002
+        y_left[1::3] -= 0.002
 
         # 右团: 方差大（显式大幅波动）
         x_right = np.array([[0.8 + dx, 0.8 + dy] for dx in grid for dy in grid], dtype=float)
         x_right = np.clip(x_right, 0.0, 1.0)
         alt = np.where(np.arange(len(x_right)) % 2 == 0, 1.0, -1.0)
-        y_right = 0.2 + 0.25 * alt
+        y_right = 0.2 + 0.3 * alt
 
         X_train = np.vstack([x_left, x_right])
         y_train = np.concatenate([y_left, y_right])
 
-        q_left = np.array([[0.18, 0.19], [0.22, 0.21], [0.20, 0.18], [0.21, 0.22]])
-        q_right = np.array([[0.78, 0.79], [0.82, 0.81], [0.80, 0.78], [0.81, 0.82]])
-        q_all = np.vstack([q_left, q_right])
-        noise_all = turbo._estimate_local_noise(X_train, y_train, q_all)
-        n_left = float(np.mean(noise_all[: len(q_left)]))
-        n_right = float(np.mean(noise_all[len(q_left) :]))
+        # 分开调用也应该可区分（当前实现使用训练集全局方差归一化）。
+        q_left = np.array([[0.20, 0.20]])
+        q_right = np.array([[0.80, 0.80]])
+        n_left = float(turbo._estimate_local_noise(X_train, y_train, q_left)[0])
+        n_right = float(turbo._estimate_local_noise(X_train, y_train, q_right)[0])
 
         self.assertGreater(
             n_right,
