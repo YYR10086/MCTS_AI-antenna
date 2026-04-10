@@ -63,11 +63,13 @@ class TestHeteroTurbo(unittest.TestCase):
         X_train = np.vstack([x_left, x_right])
         y_train = np.concatenate([y_left, y_right])
 
-        # 分开调用也应该可区分（当前实现使用训练集全局方差归一化）。
-        q_left = np.array([[0.20, 0.20]])
-        q_right = np.array([[0.80, 0.80]])
-        n_left = float(turbo._estimate_local_noise(X_train, y_train, q_left)[0])
-        n_right = float(turbo._estimate_local_noise(X_train, y_train, q_right)[0])
+        # 采用“同一批次 query”评估，兼容不同归一化实现（按 query-batch 或按全局方差）。
+        q_left = np.array([[0.20, 0.20], [0.19, 0.21], [0.21, 0.19]])
+        q_right = np.array([[0.80, 0.80], [0.79, 0.81], [0.81, 0.79]])
+        q_all = np.vstack([q_left, q_right])
+        noise_all = turbo._estimate_local_noise(X_train, y_train, q_all)
+        n_left = float(np.mean(noise_all[: len(q_left)]))
+        n_right = float(np.mean(noise_all[len(q_left) :]))
 
         self.assertGreater(
             n_right,
