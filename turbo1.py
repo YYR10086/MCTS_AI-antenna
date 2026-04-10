@@ -70,6 +70,11 @@ class Turbo1:
         use_pull=0,
         use_lcb=0,
         kappa=2.0,
+        use_hetero_lcb=1,
+        hetero_beta0=2.2,
+        hetero_beta1=0.8,
+        hetero_noise_penalty=0.35,
+        hetero_k_neighbors=6,
         length_min=0.5**7,
         length_max=1.8,
         length_init=0.8,
@@ -131,6 +136,12 @@ class Turbo1:
         #lcb
         self.use_lcb = use_lcb
         self.kappa = kappa
+        self.use_hetero_lcb = bool(use_hetero_lcb)
+        self.hetero_beta0 = float(hetero_beta0)
+        self.hetero_beta1 = float(hetero_beta1)
+        self.hetero_noise_penalty = float(hetero_noise_penalty)
+        self.hetero_k_neighbors = int(hetero_k_neighbors)
+        self.local_noise_cand = None
 
         # Tolerances and counters
         self.n_cand = min(100 * self.dim, 5000)
@@ -172,6 +183,29 @@ class Turbo1:
         self.prob_push = np.ones(self.dim) / self.dim
         self.init_iter = True
         #print(self.prob_pull)
+
+    def _estimate_local_noise(self, X_train, y_train, X_query):
+        """Estimate heteroscedastic local noise by KNN variance in trust region."""
+        if len(X_train) < 3:
+            return np.ones(len(X_query))
+        k = max(3, min(self.hetero_k_neighbors, len(X_train)))
+        # Pairwise squared distances: (n_query, n_train)
+        d2 = np.sum((X_query[:, None, :] - X_train[None, :, :]) ** 2, axis=2)
+        nn_idx = np.argpartition(d2, kth=k - 1, axis=1)[:, :k]
+        local_samples = y_train[nn_idx]
+
+        # Distance-weighted local variance (closer neighbors have larger weights).
+        nn_d2 = np.take_along_axis(d2, nn_idx, axis=1)
+        weights = 1.0 / (np.sqrt(nn_d2) + 1e-8)
+        weights = weights / np.sum(weights, axis=1, keepdims=True)
+        local_mean = np.sum(weights * local_samples, axis=1, keepdims=True)
+        local_var = np.sum(weights * (local_samples - local_mean) ** 2, axis=1)
+
+        # Normalize by global variance of current trust-region observations.
+        # This avoids query-batch-dependent normalization that can mask differences.
+        global_var = float(np.var(y_train))
+        scale = max(global_var, 1e-8)
+        return np.clip(local_var / scale, 0.0, 3.0)
 
     def _adjust_length(self, fX_next):
         if np.min(fX_next) < np.min(self._fX) - 1e-3 * math.fabs(np.min(self._fX)):
@@ -305,6 +339,7 @@ class Turbo1:
 
         # De-standardize the sampled values
         y_cand = mu + sigma * y_cand
+        self.local_noise_cand = self._estimate_local_noise(X, fX.ravel(), X_cand)
         #print(y_cand.shape)
         return X_cand, y_cand, hypers
 
@@ -312,7 +347,17 @@ class Turbo1:
         """Select candidates."""
         X_next = np.ones((self.batch_size, self.dim))
         _y_cand = deepcopy(y_cand)
-        if self.use_lcb:
+        if self.use_hetero_lcb:
+            # HEBO-inspired: dynamic exploration + local heteroscedastic penalty.
+            progress = 0.0 if self.budget <= 0 else np.clip(self.used_budget / max(self.budget, 1), 0.0, 1.0)
+            beta_t = self.hetero_beta0 * (1.0 - progress) + self.hetero_beta1 * progress
+            std = np.expand_dims(np.sqrt(np.maximum(self.f_var, 1e-12)), 1).repeat(self.batch_size, axis=1)
+            local_noise = self.local_noise_cand
+            if local_noise is None:
+                local_noise = np.ones((len(X_cand),), dtype=float)
+            local_noise = np.expand_dims(local_noise, 1).repeat(self.batch_size, axis=1)
+            _y_cand = y_cand - beta_t * std + self.hetero_noise_penalty * local_noise
+        elif self.use_lcb:
             print("Applying LCB...")
             f_var = np.expand_dims(np.sqrt(self.f_var), 1).repeat(self.batch_size, axis=1)
             #print(f_var.shape)
