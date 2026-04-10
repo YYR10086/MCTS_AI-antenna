@@ -193,10 +193,18 @@ class Turbo1:
         d2 = np.sum((X_query[:, None, :] - X_train[None, :, :]) ** 2, axis=2)
         nn_idx = np.argpartition(d2, kth=k - 1, axis=1)[:, :k]
         local_samples = y_train[nn_idx]
-        local_var = np.var(local_samples, axis=1)
-        # Robust normalization to [0, 1]-like scale
-        q80 = np.quantile(local_var, 0.8)
-        scale = q80 if q80 > 1e-8 else (np.mean(local_var) + 1e-8)
+
+        # Distance-weighted local variance (closer neighbors have larger weights).
+        nn_d2 = np.take_along_axis(d2, nn_idx, axis=1)
+        weights = 1.0 / (np.sqrt(nn_d2) + 1e-8)
+        weights = weights / np.sum(weights, axis=1, keepdims=True)
+        local_mean = np.sum(weights * local_samples, axis=1, keepdims=True)
+        local_var = np.sum(weights * (local_samples - local_mean) ** 2, axis=1)
+
+        # Normalize by global variance of current trust-region observations.
+        # This avoids query-batch-dependent normalization that can mask differences.
+        global_var = float(np.var(y_train))
+        scale = max(global_var, 1e-8)
         return np.clip(local_var / scale, 0.0, 3.0)
 
     def _adjust_length(self, fX_next):

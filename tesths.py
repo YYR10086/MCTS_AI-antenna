@@ -45,23 +45,24 @@ class TestHeteroTurbo(unittest.TestCase):
         期望 _estimate_local_noise 在右团 query 的估计值更高。
         """
         turbo = _make_turbo_for_unit_test(dim=2)
-        rng = np.random.default_rng(1234)
 
-        # 左团: 方差小
-        x_left = np.clip(rng.normal(loc=[0.2, 0.2], scale=0.03, size=(40, 2)), 0.0, 1.0)
-        y_left = 0.2 + rng.normal(0.0, 0.01, size=40)
+        # 左团: 方差小（几乎常数）
+        grid = np.linspace(-0.03, 0.03, 8)
+        x_left = np.array([[0.2 + dx, 0.2 + dy] for dx in grid for dy in grid], dtype=float)
+        x_left = np.clip(x_left, 0.0, 1.0)
+        y_left = 0.2 + 0.005 * np.sin(np.arange(len(x_left)))
 
-        # 右团: 方差大
-        x_right = np.clip(rng.normal(loc=[0.8, 0.8], scale=0.03, size=(40, 2)), 0.0, 1.0)
-        y_right = 0.2 + rng.normal(0.0, 0.15, size=40)
+        # 右团: 方差大（显式大幅波动）
+        x_right = np.array([[0.8 + dx, 0.8 + dy] for dx in grid for dy in grid], dtype=float)
+        x_right = np.clip(x_right, 0.0, 1.0)
+        alt = np.where(np.arange(len(x_right)) % 2 == 0, 1.0, -1.0)
+        y_right = 0.2 + 0.25 * alt
 
         X_train = np.vstack([x_left, x_right])
         y_train = np.concatenate([y_left, y_right])
 
-        # 注意：_estimate_local_noise 的归一化是“对本次 query 集合内部”做的，
-        # 因此必须一次性同时传入两侧 query 才能做相对比较。
-        q_left = np.clip(rng.normal(loc=[0.2, 0.2], scale=0.01, size=(8, 2)), 0.0, 1.0)
-        q_right = np.clip(rng.normal(loc=[0.8, 0.8], scale=0.01, size=(8, 2)), 0.0, 1.0)
+        q_left = np.array([[0.18, 0.19], [0.22, 0.21], [0.20, 0.18], [0.21, 0.22]])
+        q_right = np.array([[0.78, 0.79], [0.82, 0.81], [0.80, 0.78], [0.81, 0.82]])
         q_all = np.vstack([q_left, q_right])
         noise_all = turbo._estimate_local_noise(X_train, y_train, q_all)
         n_left = float(np.mean(noise_all[: len(q_left)]))
@@ -71,6 +72,11 @@ class TestHeteroTurbo(unittest.TestCase):
             n_right,
             n_left,
             msg=f"异质噪声估计异常：右团(高噪)={n_right:.4f} 不大于 左团(低噪)={n_left:.4f}",
+        )
+        self.assertGreater(
+            n_right - n_left,
+            0.15,
+            msg=f"区分度不足：右团与左团差值={n_right - n_left:.4f}",
         )
 
     @unittest.skipIf(np is None, "numpy 未安装，跳过数值测试")
