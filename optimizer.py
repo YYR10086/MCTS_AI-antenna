@@ -83,7 +83,7 @@ class SpacePartitioningOptimizer(AbstractOptimizer):
     self.init_batches = []
 
   def _read_config(self):
-    return {'turbo_training_steps': 100, 'turbo_length_retries': 10, 'turbo_length_init_method': 'default', 'experimental_design': 'lhs_classic_ratio', 'n_init_points': 24, 'max_tree_depth': 5, 'kmeans_resplits': 10, 'split_model': {'type': 'SVC', 'args': {'kernel': 'poly', 'gamma': 'scale', 'C': 745.3227447730735}}, 'reset_no_improvement': 8, 'reset_split_after': 4, 'turbo': {'budget': 128, 'use_cylinder': 0, 'use_pull': 0, 'use_lcb': 0, 'kappa': 2.0, 'use_decay': 1, 'decay_alpha': 0.49937937259674076, 'decay_threshold': 0.5, 'length_min': 1e-06, 'length_max': 2.0, 'length_init': 0.8, 'length_multiplier': 2.0}, 'sampler_seed': 42, 'optimizer_seed': 578330}
+    return {'turbo_training_steps': 100, 'turbo_length_retries': 10, 'turbo_length_init_method': 'default', 'experimental_design': 'lhs_classic_ratio', 'n_init_points': 24, 'max_tree_depth': 5, 'kmeans_resplits': 10, 'split_model': {'type': 'SVC', 'args': {'kernel': 'poly', 'gamma': 'scale', 'C': 745.3227447730735}}, 'reset_no_improvement': 8, 'reset_split_after': 4, 'turbo': {'budget': 128, 'use_cylinder': 0, 'use_pull': 0, 'use_lcb': 0, 'kappa': 2.0, 'use_hetero_lcb': 1, 'hetero_beta0': 2.2, 'hetero_beta1': 0.8, 'hetero_noise_penalty': 0.35, 'hetero_k_neighbors': 6, 'use_decay': 1, 'decay_alpha': 0.49937937259674076, 'decay_threshold': 0.5, 'length_min': 1e-06, 'length_max': 2.0, 'length_init': 0.8, 'length_multiplier': 2.0}, 'sampler_seed': 42, 'optimizer_seed': 578330}
 
   def _init(self, n_suggestions):
     self.batch_size = n_suggestions
@@ -212,6 +212,11 @@ class SpacePartitioningOptimizer(AbstractOptimizer):
         use_pull=model_config['use_pull'],
         use_lcb=model_config['use_lcb'],
         kappa=model_config['kappa'],
+        use_hetero_lcb=model_config.get('use_hetero_lcb', 1),
+        hetero_beta0=model_config.get('hetero_beta0', 2.2),
+        hetero_beta1=model_config.get('hetero_beta1', 0.8),
+        hetero_noise_penalty=model_config.get('hetero_noise_penalty', 0.35),
+        hetero_k_neighbors=model_config.get('hetero_k_neighbors', 6),
         length_min=model_config['length_min'],
         length_max=model_config['length_max'],
         length_init=model_config['length_init'],
@@ -253,6 +258,8 @@ class SpacePartitioningOptimizer(AbstractOptimizer):
       if np.sum(in_region_idx) >= n_suggestions:
         X_cand, y_cand = X_cand[in_region_idx], y_cand[in_region_idx]
         self.turbo.f_var = self.turbo.f_var[in_region_idx]
+        if getattr(self.turbo, 'local_noise_cand', None) is not None:
+          self.turbo.local_noise_cand = self.turbo.local_noise_cand[in_region_idx]
         if DEBUG:
           print('Found a suitable set of candidates.')
         break
@@ -375,32 +382,3 @@ class SpacePartitioningOptimizer(AbstractOptimizer):
 
 if __name__ == '__main__':
   experiment_main(SpacePartitioningOptimizer)
-
-
-  def _suggest(self, n_suggestions):
-    X = to_unit_cube(deepcopy(self.X), self.lb, self.ub)
-    y = deepcopy(self.y)
-    if not self.node:
-    else:
-      idx = (self._get_in_node_region(X, self.node) == 1)
-      X = X[idx]
-      y = y[idx]
-    length_reties = self.config['turbo_length_retries']
-    for retry in range(length_reties):
-      XX = X
-      yy = copula_standardize(y.ravel())  # 函数值标准化
-      X_cand, y_cand, _ = self.turbo._create_candidates(
-        XX, yy, length=length, n_training_steps=self.config['turbo_training_steps'], hypers={})
-      in_region_predictions = self._get_in_node_region(X_cand, self.node)
-      in_region_idx = in_region_predictions == 1
-      if DEBUG:
-        print(f'In region: {np.sum(in_region_idx)} out of {len(X_cand)}')
-      if np.sum(in_region_idx) >= n_suggestions:
-        X_cand, y_cand = X_cand[in_region_idx], y_cand[in_region_idx]
-        self.turbo.f_var = self.turbo.f_var[in_region_idx]
-      else:
-        length /= 2
-        if DEBUG:
-          print(f'Retrying {retry + 1}/{length_reties} time')
-    X_cand = self.turbo._select_candidates(X_cand, y_cand)[:n_suggestions, :]
-    return X_cand
