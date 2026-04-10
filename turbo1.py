@@ -205,7 +205,8 @@ class Turbo1:
         # This avoids query-batch-dependent normalization that can mask differences.
         global_var = float(np.var(y_train))
         scale = max(global_var, 1e-8)
-        return np.clip(local_var / scale, 0.0, 3.0)
+        # Keep full contrast (no hard upper clipping), only enforce non-negative.
+        return np.maximum(local_var / scale, 0.0)
 
     def _adjust_length(self, fX_next):
         if np.min(fX_next) < np.min(self._fX) - 1e-3 * math.fabs(np.min(self._fX)):
