@@ -18,6 +18,7 @@ import csv
 import json
 import math
 import os
+import signal
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,18 @@ BAND_1 = (26.0, 32.0)
 BAND_2 = (37.0, 39.0)
 TARGET_FREQS = (28.0, 38.0)
 S11_THRESHOLD_DB = -10.0
+STOP_REQUESTED = False
+
+
+def _request_stop(signum, _frame) -> None:
+    """捕获 Ctrl+C / 终止信号，安全中断当前批次流程。"""
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    print(f"\n[INTERRUPT] 收到信号 {signum}，将在当前步骤后安全退出。")
+
+
+signal.signal(signal.SIGINT, _request_stop)
+signal.signal(signal.SIGTERM, _request_stop)
 
 
 @dataclass
@@ -212,6 +225,9 @@ def run_single_simulation(
     """运行一次仿真并返回结果字典。"""
     _ = (setup_name, sweep_name)  # 预留参数，当前使用全局 setup/sweep 常量
 
+    if STOP_REQUESTED:
+        raise KeyboardInterrupt("检测到用户中断请求，跳过本次仿真。")
+
     project_file = Path(project_path)
     if not project_file.exists():
         raise FileNotFoundError(f"HFSS 工程不存在: {project_file}")
@@ -227,7 +243,11 @@ def run_single_simulation(
         )
 
         _apply_design_variables(hfss, design_vars)
+        if STOP_REQUESTED:
+            raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
         hfss.analyze_setup(SETUP_NAME)
+        if STOP_REQUESTED:
+            raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
 
         freqs, s11_db = _get_s11_curve(hfss)
         band1_ok = _band_ok(freqs, s11_db, BAND_1, S11_THRESHOLD_DB)
@@ -255,6 +275,8 @@ def run_single_simulation(
             "dualband_match_ok": bool(band1_ok and band2_ok),
         }
     except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, KeyboardInterrupt):
+            raise
         raise RuntimeError(f"仿真失败: {exc}") from exc
     finally:
         if hfss is not None:
@@ -340,6 +362,9 @@ def run_optimization(
         )
 
         for i in range(1, budget + 1):
+            if STOP_REQUESTED:
+                print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
+                break
             cand = optimizer.suggest(1)[0]
             vars_i = DesignVariables(**{**asdict(default_vars), **cand})
 
@@ -347,6 +372,9 @@ def run_optimization(
             try:
                 result = run_single_simulation(project_path=project_path, design_vars=vars_i)
                 loss = _objective(result)
+            except KeyboardInterrupt:
+                print("[INTERRUPT] 单次仿真被用户中断，结束优化并保留已有结果。")
+                break
             except Exception as exc:  # noqa: BLE001
                 result = {
                     "design_vars": asdict(vars_i),
@@ -407,31 +435,44 @@ def run_optimization(
 
 
 def main() -> None:
-    # 1) 单次仿真（用默认参数）
-    one_shot = run_single_simulation(
-        project_path=PROJECT_PATH,
-        design_vars=DesignVariables(),
-        setup_name=SETUP_NAME,
-        sweep_name=SWEEP_NAME,
-    )
+    try:
+        # 1) 单次仿真（用默认参数）
+        one_shot = run_single_simulation(
+            project_path=PROJECT_PATH,
+            design_vars=DesignVariables(),
+            setup_name=SETUP_NAME,
+            sweep_name=SWEEP_NAME,
+        )
 
-    Path("outputs").mkdir(exist_ok=True)
-    with open("outputs/single_run_result.json", "w", encoding="utf-8") as f:
-        json.dump(one_shot, f, ensure_ascii=False, indent=2)
-    _export_s11_csv(one_shot, "outputs/single_run_s11.csv")
+        Path("outputs").mkdir(exist_ok=True)
+        with open("outputs/single_run_result.json", "w", encoding="utf-8") as f:
+            json.dump(one_shot, f, ensure_ascii=False, indent=2)
+        _export_s11_csv(one_shot, "outputs/single_run_s11.csv")
 
-    # 2) 优化（调用改进算法）
-    opt_result = run_optimization(project_path=PROJECT_PATH, budget=20, output_dir="outputs")
+        print("\n=== 单次仿真结果 ===")
+        print(
+            json.dumps(
+                {
+                    "gain_28ghz_db": one_shot["gain_28ghz_db"],
+                    "gain_38ghz_db": one_shot["gain_38ghz_db"],
+                    "dualband_match_ok": one_shot["dualband_match_ok"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
 
-    print("\n=== 单次仿真结果 ===")
-    print(json.dumps({
-        "gain_28ghz_db": one_shot["gain_28ghz_db"],
-        "gain_38ghz_db": one_shot["gain_38ghz_db"],
-        "dualband_match_ok": one_shot["dualband_match_ok"],
-    }, ensure_ascii=False, indent=2))
+        if STOP_REQUESTED:
+            print("[INTERRUPT] 用户中断后仅完成单次仿真，跳过优化。")
+            return
 
-    print("\n=== 优化结果文件 ===")
-    print(json.dumps(opt_result, ensure_ascii=False, indent=2))
+        # 2) 优化（调用改进算法）
+        opt_result = run_optimization(project_path=PROJECT_PATH, budget=20, output_dir="outputs")
+
+        print("\n=== 优化结果文件 ===")
+        print(json.dumps(opt_result, ensure_ascii=False, indent=2))
+    except KeyboardInterrupt:
+        print("\n[INTERRUPT] 用户主动中断，脚本已安全退出。")
 
 
 if __name__ == "__main__":
