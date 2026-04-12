@@ -20,14 +20,49 @@ if not hasattr(np, "unicode_"):
 if not hasattr(np, "bool_"):
     np.bool_ = bool
 
-try:
-    import submissions.space_decay.optimizer as space_decay_optimizer
-except ImportError:
-    import optimizer as space_decay_optimizer
 
-SpacePartitioningOptimizer = space_decay_optimizer.SpacePartitioningOptimizer
-if hasattr(space_decay_optimizer, "DEBUG"):
-    space_decay_optimizer.DEBUG = False
+class FallbackRandomOptimizer:
+    """当 bayesmark/optimizer 依赖冲突时的兜底优化器。"""
+
+    def __init__(self, api_config):
+        self.api_config = api_config
+        self.rng = np.random.default_rng(42)
+
+    def suggest(self, n_suggestions=1):
+        out = []
+        for _ in range(n_suggestions):
+            one = {}
+            for k, cfg in self.api_config.items():
+                lo, hi = cfg["range"]
+                one[k] = float(self.rng.uniform(lo, hi))
+            out.append(one)
+        return out
+
+    def observe(self, X_observed, Y_observed):
+        return
+
+
+def build_optimizer(api_config):
+    """
+    优先使用原 SpacePartitioningOptimizer（含 hetero-TuRBO）。
+    若因 bayesmark/sklearn 版本冲突失败，则退化到随机优化器，避免脚本启动失败。
+    """
+    try:
+        try:
+            import submissions.space_decay.optimizer as space_decay_optimizer
+        except Exception:
+            import optimizer as space_decay_optimizer
+
+        if hasattr(space_decay_optimizer, "DEBUG"):
+            space_decay_optimizer.DEBUG = False
+
+        optimizer_cls = space_decay_optimizer.SpacePartitioningOptimizer
+        patch_optimizer_config(optimizer_cls)
+        print("使用 SpacePartitioningOptimizer (hetero-TuRBO).")
+        return optimizer_cls(api_config=api_config)
+    except Exception as e:
+        print(f"[警告] 无法加载 SpacePartitioningOptimizer，降级为随机优化器。原因: {e}")
+        return FallbackRandomOptimizer(api_config=api_config)
 
 
 # ========= HFSS 工程信息（按你的要求） =========
@@ -68,9 +103,9 @@ class DesignVariables:
     y1: float = 1.65
 
 
-def patch_optimizer_config():
+def patch_optimizer_config(optimizer_cls):
     """使用你之前做好的 hetero-TuRBO 算法配置。"""
-    original_read_config = SpacePartitioningOptimizer._read_config
+    original_read_config = optimizer_cls._read_config
 
     def patched_read_config(self):
         conf = original_read_config(self)
@@ -83,7 +118,7 @@ def patch_optimizer_config():
         conf["turbo"]["hetero_k_neighbors"] = 6
         return conf
 
-    SpacePartitioningOptimizer._read_config = patched_read_config
+    optimizer_cls._read_config = patched_read_config
 
 
 def apply_design_variables(hfss: Hfss, dv: DesignVariables):
@@ -236,8 +271,6 @@ def export_iteration_csv(iter_id: int, result: Dict, loss: float):
 
 
 def main():
-    patch_optimizer_config()
-
     if not os.path.exists(PROJECT_PATH):
         raise FileNotFoundError(f"HFSS 工程不存在：{PROJECT_PATH}")
 
@@ -255,7 +288,7 @@ def main():
         "y1": {"type": "real", "space": "linear", "range": (1.0, 2.2)},
     }
 
-    optimizer = SpacePartitioningOptimizer(api_config=api_config)
+    optimizer = build_optimizer(api_config)
     default_vars = DesignVariables()
     budget = 20
 
