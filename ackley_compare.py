@@ -1,23 +1,5 @@
 """
 多维基准对比（可中断续跑）
-=========================
-
-对比算法：
-1) TuRBO (hetero scoring)
-2) 传统 BO: GP + EI
-3) Genetic Algorithm (GA)
-4) Differential Evolution (DE)
-
-测试函数：
-- Ackley
-- F4（Rosenbrock 变体，本文实现采用稳定的 '+' 形式）
-
-维度：
-- 10, 20, 50
-
-中断续跑：
-- 每个任务（函数+维度+算法）都有独立 checkpoint
-- Ctrl+C 后可用 --resume 继续
 """
 
 from __future__ import annotations
