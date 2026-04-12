@@ -1,153 +1,418 @@
-import os
-import sys
 import csv
+import json
+import os
+import signal
+import sys
+from dataclasses import asdict, dataclass
+from typing import Dict, Tuple
+
 import numpy as np
 from pyaedt import Hfss
 
 sys.path.append(os.getcwd())
 
-try:
-    import submissions.space_decay.optimizer as space_decay_optimizer
-except ImportError:
-    import optimizer as space_decay_optimizer
+# 兼容 bayesmark 在 NumPy 2.x 下对 np.float_ 的旧引用
+if not hasattr(np, "float_"):
+    np.float_ = np.float64
+if not hasattr(np, "int_"):
+    np.int_ = np.int64
+if not hasattr(np, "unicode_"):
+    np.unicode_ = np.str_
+if not hasattr(np, "bool_"):
+    np.bool_ = bool
 
-SpacePartitioningOptimizer = space_decay_optimizer.SpacePartitioningOptimizer
 
-if hasattr(space_decay_optimizer, "DEBUG"):
-    space_decay_optimizer.DEBUG = False
+class FallbackRandomOptimizer:
+    """当 bayesmark/optimizer 依赖冲突时的兜底优化器。"""
 
-original_read_config = SpacePartitioningOptimizer._read_config
+    def __init__(self, api_config):
+        self.api_config = api_config
+        self.rng = np.random.default_rng(42)
 
-def patched_read_config(self):
-    conf = original_read_config(self)
-    conf["reset_no_improvement"] = 1000000
-    conf["debug"] = False
-    conf["DEBUG"] = False
-    return conf
+    def suggest(self, n_suggestions=1):
+        out = []
+        for _ in range(n_suggestions):
+            one = {}
+            for k, cfg in self.api_config.items():
+                lo, hi = cfg["range"]
+                one[k] = float(self.rng.uniform(lo, hi))
+            out.append(one)
+        return out
 
-SpacePartitioningOptimizer._read_config = patched_read_config
-print("✓ 已禁用优化器重置逻辑\n")
+    def observe(self, X_observed, Y_observed):
+        return
 
-# ================= 配置区 =================
-PROJECT_PATH = os.path.abspath(r"ceramic_monoblock_MMDS_Band.aedt")
-SETUP_NAME = "Setup_5GNR_Band_N41"
-SWEEP_NAME = f"{SETUP_NAME} : LastAdaptive"   # 如有真实 Sweep，建议替换
-TARGET_FREQ_GHZ = 2.6                         # 改成你的目标频点
-CSV_LOG = "hfss_optimization_log.csv"
 
-if not os.path.exists(PROJECT_PATH):
-    print(f"错误：项目文件不存在: {PROJECT_PATH}")
-    sys.exit(1)
-
-# ================= HFSS 环境 =================
-print("正在连接 HFSS...")
-hfss = Hfss(project=PROJECT_PATH, version="2025.1")
-print("HFSS 连接成功！\n")
-
-def extract_target_s11(solution_data, target_freq_ghz):
+def build_optimizer(api_config):
     """
-    从 HFSS 返回的整条 S11 曲线中提取目标频点的值
+    优先使用原 SpacePartitioningOptimizer（含 hetero-TuRBO）。
+    若因 bayesmark/sklearn 版本冲突失败，则退化到随机优化器，避免脚本启动失败。
     """
-    freqs = np.array(solution_data.primary_sweep_values, dtype=float)
-    vals = np.array(solution_data.data_real(), dtype=float)
-
-    if len(freqs) == 0 or len(vals) == 0:
-        raise ValueError("未获取到有效的 S11 曲线数据。")
-
-    idx = np.argmin(np.abs(freqs - target_freq_ghz))
-    return float(vals[idx]), float(freqs[idx])
-
-def simulate(params_dict):
     try:
-        # 更新参数
-        hfss["res1_capY"] = f"{params_dict['res1_capY']:.4f}mm"
-        hfss["gap1to2"] = f"{params_dict['gap1to2']:.4f}mm"
-        hfss["input_gap"] = f"{params_dict['input_gap']:.4f}mm"
+        try:
+            import submissions.space_decay.optimizer as space_decay_optimizer
+        except Exception:
+            import optimizer as space_decay_optimizer
 
-        # 运行仿真
-        hfss.analyze_setup(SETUP_NAME)
+        if hasattr(space_decay_optimizer, "DEBUG"):
+            space_decay_optimizer.DEBUG = False
 
-        # 读取结果
-        sol = hfss.post.get_solution_data(
-            expressions="dB(S(1,1))",
-            setup_sweep_name=SWEEP_NAME
-        )
-
-        if sol is None:
-            raise ValueError("get_solution_data 返回 None。")
-
-        s11, actual_freq = extract_target_s11(sol, TARGET_FREQ_GHZ)
-        print(f"  目标频点附近 S11: {s11:.3f} dB @ {actual_freq:.6f} GHz")
-        return float(s11), True
-
+        optimizer_cls = space_decay_optimizer.SpacePartitioningOptimizer
+        patch_optimizer_config(optimizer_cls)
+        print("使用 SpacePartitioningOptimizer (hetero-TuRBO).")
+        return optimizer_cls(api_config=api_config)
     except Exception as e:
-        print(f"  仿真失败: {e}")
-        # 最小化问题里，失败给一个大惩罚
-        return 100.0, False
+        print(f"[警告] 无法加载 SpacePartitioningOptimizer，降级为随机优化器。原因: {e}")
+        return FallbackRandomOptimizer(api_config=api_config)
 
-def log_result(iter_id, params, loss, success):
-    file_exists = os.path.exists(CSV_LOG)
-    with open(CSV_LOG, "a", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["iter", "res1_capY", "gap1to2", "input_gap", "s11_db", "success"])
-        writer.writerow([
-            iter_id,
-            params["res1_capY"],
-            params["gap1to2"],
-            params["input_gap"],
-            loss,
-            int(success)
-        ])
 
-# ================= 运行优化 =================
-if __name__ == "__main__":
-    api_config = {
-        "res1_capY": {"type": "real", "space": "linear", "range": (1.2, 1.8)},
-        "gap1to2": {"type": "real", "space": "linear", "range": (0.005, 0.025)},
-        "input_gap": {"type": "real", "space": "linear", "range": (0.01, 0.05)}
+# ========= HFSS 工程信息（按你的要求） =========
+PROJECT_NAME = "A1"
+DESIGN_NAME = "HFSSDesign1"
+SETUP_NAME = "Setup1"
+SWEEP_NAME = "Sweep"
+FAR_FIELD_SPHERE = "Infinite Sphere1"
+PROJECT_PATH = os.path.abspath("A1.aedt")  # 完整路径占位，可改成绝对路径
+
+CSV_LOG = "hfss_dualband_optimization_log.csv"
+FINAL_JSON = "hfss_dualband_final_result.json"
+
+# 频段要求
+BAND1 = (26.0, 32.0)  # GHz
+BAND2 = (37.0, 39.0)  # GHz
+TARGET_GAINS = (28.0, 38.0)  # GHz
+S11_THRESHOLD_DB = -10.0
+STOP_REQUESTED = False
+
+
+def _request_stop(signum, _frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    print(f"\n[中断信号] 收到信号 {signum}，将在当前步骤结束后安全退出...")
+
+
+signal.signal(signal.SIGINT, _request_stop)
+signal.signal(signal.SIGTERM, _request_stop)
+
+
+@dataclass
+class DesignVariables:
+    W: float = 15.0
+    h: float = 0.787
+    Lx: float = 9.3
+    Ly: float = 1.15
+    dy: float = 2.27
+    dc: float = 1.0
+    Rc: float = 6.48
+    Sl: float = 3.97
+    Sw: float = 0.4
+    d: float = 0.8
+    y2: float = 1.46
+    xx: float = 0.0
+    S: float = 1.2
+    dp: float = 0.42
+    x1: float = 1.8
+    y1: float = 1.65
+
+
+def patch_optimizer_config(optimizer_cls):
+    """使用你之前做好的 hetero-TuRBO 算法配置。"""
+    original_read_config = optimizer_cls._read_config
+
+    def patched_read_config(self):
+        conf = original_read_config(self)
+        conf["reset_no_improvement"] = 1000000
+        conf["turbo_training_steps"] = 80
+        conf["turbo"]["use_hetero_lcb"] = 1
+        conf["turbo"]["hetero_beta0"] = 2.2
+        conf["turbo"]["hetero_beta1"] = 0.8
+        conf["turbo"]["hetero_noise_penalty"] = 0.35
+        conf["turbo"]["hetero_k_neighbors"] = 6
+        return conf
+
+    optimizer_cls._read_config = patched_read_config
+
+
+def apply_design_variables(hfss: Hfss, dv: DesignVariables):
+    """将设计变量写入 HFSS（mm）。"""
+    for key, val in asdict(dv).items():
+        hfss[key] = f"{val:.6f}mm"
+
+
+def get_s11_curve(hfss: Hfss) -> Tuple[np.ndarray, np.ndarray]:
+    setups = [f"{SETUP_NAME} : {SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
+    exprs = ["dB(S(1,1))", "S(1,1)"]
+    last_err = None
+    for ss in setups:
+        for ex in exprs:
+            try:
+                sol = hfss.post.get_solution_data(expressions=ex, setup_sweep_name=ss)
+                if sol is None:
+                    continue
+                freqs = np.array(sol.primary_sweep_values, dtype=float)
+                vals = np.array(sol.data_real(), dtype=float)
+                if freqs.size == 0 or vals.size == 0:
+                    continue
+                # 若不是 dB 表达式，则转 dB
+                if ex == "S(1,1)":
+                    vals = 20.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
+                return freqs, vals
+            except Exception as e:
+                last_err = e
+                continue
+    raise RuntimeError(f"未能提取 S11 曲线（检查 setup/sweep/表达式）。最后错误: {last_err}")
+
+
+def band_match_ok(freqs: np.ndarray, s11_db: np.ndarray, band: Tuple[float, float], threshold_db=-10.0):
+    fmin, fmax = band
+    m = (freqs >= fmin) & (freqs <= fmax)
+    if np.sum(m) == 0:
+        return False
+    return bool(np.all(s11_db[m] < threshold_db))
+
+
+def extract_gain_at_freq(hfss: Hfss, target_freq_ghz: float) -> float:
+    """
+    提取指定频点增益（基于 Infinite Sphere1）。
+    若场景表达式差异导致失败，返回 nan。
+    """
+    setups = [f"{SETUP_NAME} : {SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
+    exprs = ["dB(GainTotal)", "dB(RealizedGainTotal)", "GainTotal"]
+    contexts = [FAR_FIELD_SPHERE, "Infinite Sphere1", None]
+    last_err = None
+    for ss in setups:
+        for ex in exprs:
+            for ctx in contexts:
+                try:
+                    kwargs = {"expressions": ex, "setup_sweep_name": ss}
+                    if ctx is not None:
+                        kwargs["context"] = ctx
+                    sol = hfss.post.get_solution_data(**kwargs)
+                    if sol is None:
+                        continue
+                    freqs = np.array(sol.primary_sweep_values, dtype=float)
+                    vals = np.array(sol.data_real(), dtype=float)
+                    if freqs.size == 0 or vals.size == 0:
+                        continue
+                    # 若不是 dB 表达式则转 dB
+                    if ex == "GainTotal":
+                        vals = 10.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
+                    idx = int(np.argmin(np.abs(freqs - target_freq_ghz)))
+                    return float(vals[idx])
+                except Exception as e:
+                    last_err = e
+                    continue
+    print(f"[警告] 无法提取 {target_freq_ghz}GHz 增益，返回 NaN。最后错误: {last_err}")
+    return float("nan")
+
+
+def evaluate_design(hfss: Hfss, dv: DesignVariables) -> Dict:
+    """
+    运行仿真并返回完整结果：
+      - S11 曲线
+      - 28/38GHz 增益
+      - 双频段是否满足 |S11|<-10dB
+    """
+    if STOP_REQUESTED:
+        raise KeyboardInterrupt("用户请求停止仿真。")
+
+    apply_design_variables(hfss, dv)
+    hfss.analyze_setup(SETUP_NAME)
+
+    if STOP_REQUESTED:
+        raise KeyboardInterrupt("用户请求停止仿真。")
+
+    freqs, s11_db = get_s11_curve(hfss)
+    b1_ok = band_match_ok(freqs, s11_db, BAND1, S11_THRESHOLD_DB)
+    b2_ok = band_match_ok(freqs, s11_db, BAND2, S11_THRESHOLD_DB)
+    dualband_ok = bool(b1_ok and b2_ok)
+
+    gain_28 = extract_gain_at_freq(hfss, TARGET_GAINS[0])
+    gain_38 = extract_gain_at_freq(hfss, TARGET_GAINS[1])
+
+    return {
+        "design_vars": asdict(dv),
+        "s11_curve": {
+            "freq_ghz": freqs.tolist(),
+            "s11_db": s11_db.tolist(),
+        },
+        "gain_28ghz_db": gain_28,
+        "gain_38ghz_db": gain_38,
+        "band_26_32_ok": b1_ok,
+        "band_37_39_ok": b2_ok,
+        "dualband_match_ok": dualband_ok,
     }
 
-    print("========== 开始 MCTS-TuRBO + HFSS 优化 ==========\n")
 
-    optimizer = SpacePartitioningOptimizer(api_config=api_config)
+def objective_from_result(result: Dict) -> float:
+    """
+    优化目标（越小越好）：
+      1) 频段不满足时加大惩罚
+      2) 次目标：提高 28/38GHz 增益（通过负号转成最小化）
+      3) 次目标：全局 S11 最小值越低越好
+    """
+    s11 = np.array(result["s11_curve"]["s11_db"], dtype=float)
+    freqs = np.array(result["s11_curve"]["freq_ghz"], dtype=float)
+    g28 = float(result["gain_28ghz_db"])
+    g38 = float(result["gain_38ghz_db"])
 
-    BUDGET = 20
-    best_s11 = float("inf")
-    best_params = None
+    penalty = 0.0
+    if not result["band_26_32_ok"]:
+        m = (freqs >= BAND1[0]) & (freqs <= BAND1[1])
+        if np.any(m):
+            penalty += float(np.mean(np.maximum(s11[m] - S11_THRESHOLD_DB, 0.0))) * 20.0
+        else:
+            penalty += 500.0
+    if not result["band_37_39_ok"]:
+        m = (freqs >= BAND2[0]) & (freqs <= BAND2[1])
+        if np.any(m):
+            penalty += float(np.mean(np.maximum(s11[m] - S11_THRESHOLD_DB, 0.0))) * 20.0
+        else:
+            penalty += 500.0
+
+    gain_term = 0.0
+    if np.isfinite(g28):
+        gain_term -= 0.5 * g28
+    if np.isfinite(g38):
+        gain_term -= 0.5 * g38
+
+    s11_term = float(np.min(s11))
+    return penalty + gain_term + s11_term
+
+
+def export_iteration_csv(iter_id: int, result: Dict, loss: float):
+    file_exists = os.path.exists(CSV_LOG)
+    with open(CSV_LOG, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        if not file_exists:
+            w.writerow(
+                [
+                    "iter",
+                    "loss",
+                    "gain_28ghz_db",
+                    "gain_38ghz_db",
+                    "band_26_32_ok",
+                    "band_37_39_ok",
+                    "dualband_match_ok",
+                    "design_vars_json",
+                ]
+            )
+        w.writerow(
+            [
+                iter_id,
+                loss,
+                result["gain_28ghz_db"],
+                result["gain_38ghz_db"],
+                int(result["band_26_32_ok"]),
+                int(result["band_37_39_ok"]),
+                int(result["dualband_match_ok"]),
+                json.dumps(result["design_vars"], ensure_ascii=False),
+            ]
+        )
+
+
+def main():
+    if not os.path.exists(PROJECT_PATH):
+        raise FileNotFoundError(f"HFSS 工程不存在：{PROJECT_PATH}")
+
+    print("连接 HFSS...")
+    hfss = None
+    best_result = None
+    best_loss = float("inf")
+
+    # 使用你之前的算法，仅优化部分变量，其余保持给定默认值
+    api_config = {
+        "Rc": {"type": "real", "space": "linear", "range": (5.5, 7.5)},
+        "S": {"type": "real", "space": "linear", "range": (0.6, 1.8)},
+        "dp": {"type": "real", "space": "linear", "range": (0.2, 0.7)},
+        "x1": {"type": "real", "space": "linear", "range": (1.0, 2.5)},
+        "y1": {"type": "real", "space": "linear", "range": (1.0, 2.2)},
+    }
+
+    optimizer = build_optimizer(api_config)
+    default_vars = DesignVariables()
+    budget = 20
 
     try:
-        for i in range(BUDGET):
-            suggestions = optimizer.suggest(1)
-            s = suggestions[0]
+        hfss = Hfss(
+            project=PROJECT_PATH,
+            design=DESIGN_NAME,
+            version="2025.1",
+            new_desktop_session=False,
+        )
 
-            print(f"[第 {i + 1}/{BUDGET} 次仿真] 参数: {s}")
-            loss, success = simulate(s)
+        for i in range(1, budget + 1):
+            if STOP_REQUESTED:
+                print("检测到中断请求，提前结束优化循环。")
+                break
+            cand = optimizer.suggest(1)[0]
+            dv = DesignVariables(**{**asdict(default_vars), **cand})
+            try:
+                result = evaluate_design(hfss, dv)
+                loss = objective_from_result(result)
+                success = True
+            except KeyboardInterrupt:
+                print("仿真被用户中断，保存当前结果并退出。")
+                break
+            except Exception as e:
+                result = {
+                    "design_vars": asdict(dv),
+                    "s11_curve": {"freq_ghz": [], "s11_db": []},
+                    "gain_28ghz_db": float("nan"),
+                    "gain_38ghz_db": float("nan"),
+                    "band_26_32_ok": False,
+                    "band_37_39_ok": False,
+                    "dualband_match_ok": False,
+                    "error": str(e),
+                }
+                loss = 1e6
+                success = False
 
-            log_result(i + 1, s, loss, success)
+            export_iteration_csv(i, result, loss)
+            optimizer.observe([cand], [loss])
 
-            if success and loss < best_s11:
-                best_s11 = loss
-                best_params = dict(s)
+            if success and loss < best_loss:
+                best_loss = loss
+                best_result = result
 
-            optimizer.observe(suggestions, [loss])
+            print(
+                f"[{i}/{budget}] loss={loss:.4f}, dualband_ok={result.get('dualband_match_ok', False)}, "
+                f"g28={result.get('gain_28ghz_db')}, g38={result.get('gain_38ghz_db')}"
+            )
 
-            if best_params is not None:
-                print(f"  当前最优 S11: {best_s11:.3f} dB")
-                print(f"  当前最优参数: {best_params}\n")
-            else:
-                print("  当前还没有成功样本。\n")
-
+    except Exception as e:
+        print(f"运行异常：{e}")
+        raise
     finally:
-        print("正在释放 HFSS...")
-        try:
-            hfss.release_desktop()
-        except Exception:
-            pass
+        if hfss is not None:
+            try:
+                hfss.release_desktop()
+            except Exception:
+                pass
 
-    print("========== 优化完成 ==========")
-    if best_params is not None:
-        print(f"最优参数: {best_params}")
-        print(f"最优 S11: {best_s11:.3f} dB")
+    if best_result is None:
+        best_result = {
+            "message": "没有成功仿真结果",
+            "project_path": PROJECT_PATH,
+            "project_name": PROJECT_NAME,
+            "design_name": DESIGN_NAME,
+            "setup_name": SETUP_NAME,
+            "sweep_name": SWEEP_NAME,
+            "far_field_sphere": FAR_FIELD_SPHERE,
+        }
     else:
-        print("没有得到有效的成功仿真结果。")
+        best_result["project_path"] = PROJECT_PATH
+        best_result["project_name"] = PROJECT_NAME
+        best_result["design_name"] = DESIGN_NAME
+        best_result["setup_name"] = SETUP_NAME
+        best_result["sweep_name"] = SWEEP_NAME
+        best_result["far_field_sphere"] = FAR_FIELD_SPHERE
+        best_result["best_loss"] = best_loss
+
+    with open(FINAL_JSON, "w", encoding="utf-8") as f:
+        json.dump(best_result, f, ensure_ascii=False, indent=2)
+    print(f"结果已导出：{FINAL_JSON}")
+
+
+if __name__ == "__main__":
+    main()
