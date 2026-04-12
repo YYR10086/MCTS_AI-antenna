@@ -19,12 +19,19 @@ import json
 import math
 import os
 import signal
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from pyaedt import Hfss
+
+try:
+    from tqdm import tqdm
+except Exception:  # noqa: BLE001
+    tqdm = None
 
 
 # -----------------------------
@@ -55,6 +62,35 @@ def _request_stop(signum, _frame) -> None:
 
 signal.signal(signal.SIGINT, _request_stop)
 signal.signal(signal.SIGTERM, _request_stop)
+
+
+class AnalyzeHeartbeat:
+    """analyze_setup 期间打印心跳，避免长时间无输出。"""
+
+    def __init__(self, tag: str, interval_sec: int = 30):
+        self.tag = tag
+        self.interval_sec = max(5, int(interval_sec))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_time = 0.0
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_sec):
+            elapsed = time.time() - self._start_time
+            print(f"[PROGRESS] {self.tag} 进行中... 已用时 {elapsed:.0f}s")
+
+    def __enter__(self):
+        self._start_time = time.time()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        elapsed = time.time() - self._start_time
+        print(f"[PROGRESS] {self.tag} 结束，总耗时 {elapsed:.1f}s")
 
 
 @dataclass
@@ -245,7 +281,8 @@ def run_single_simulation(
         _apply_design_variables(hfss, design_vars)
         if STOP_REQUESTED:
             raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
-        hfss.analyze_setup(SETUP_NAME)
+        with AnalyzeHeartbeat(tag=f"HFSS analyze_setup({SETUP_NAME})", interval_sec=30):
+            hfss.analyze_setup(SETUP_NAME)
         if STOP_REQUESTED:
             raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
 
@@ -361,7 +398,11 @@ def run_optimization(
             ]
         )
 
-        for i in range(1, budget + 1):
+        index_iter = range(1, budget + 1)
+        if tqdm is not None:
+            index_iter = tqdm(index_iter, total=budget, desc="HFSS Optimization", unit="iter")
+
+        for i in index_iter:
             if STOP_REQUESTED:
                 print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
                 break
@@ -408,6 +449,11 @@ def run_optimization(
                 f"[{i}/{budget}] loss={loss:.4f} dualband={result.get('dualband_match_ok', False)} "
                 f"g28={result.get('gain_28ghz_db')} g38={result.get('gain_38ghz_db')}"
             )
+            if tqdm is not None and hasattr(index_iter, "set_postfix"):
+                index_iter.set_postfix(
+                    loss=f"{loss:.3f}",
+                    dual=bool(result.get("dualband_match_ok", False)),
+                )
 
     if best_result is None:
         final = {
