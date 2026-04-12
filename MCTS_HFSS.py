@@ -10,6 +10,12 @@ from pyaedt import Hfss
 
 sys.path.append(os.getcwd())
 
+# 兼容 bayesmark 在 NumPy 2.x 下对 np.float_ 的旧引用
+if not hasattr(np, "float_"):
+    np.float_ = np.float64
+if not hasattr(np, "int_"):
+    np.int_ = np.int64
+
 try:
     import submissions.space_decay.optimizer as space_decay_optimizer
 except ImportError:
