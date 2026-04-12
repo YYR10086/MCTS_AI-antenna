@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import signal
 import sys
 from dataclasses import asdict, dataclass
 from typing import Dict, Tuple
@@ -81,6 +82,17 @@ BAND1 = (26.0, 32.0)  # GHz
 BAND2 = (37.0, 39.0)  # GHz
 TARGET_GAINS = (28.0, 38.0)  # GHz
 S11_THRESHOLD_DB = -10.0
+STOP_REQUESTED = False
+
+
+def _request_stop(signum, _frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    print(f"\n[中断信号] 收到信号 {signum}，将在当前步骤结束后安全退出...")
+
+
+signal.signal(signal.SIGINT, _request_stop)
+signal.signal(signal.SIGTERM, _request_stop)
 
 
 @dataclass
@@ -128,15 +140,27 @@ def apply_design_variables(hfss: Hfss, dv: DesignVariables):
 
 
 def get_s11_curve(hfss: Hfss) -> Tuple[np.ndarray, np.ndarray]:
-    setup_sweep = f"{SETUP_NAME} : {SWEEP_NAME}"
-    sol = hfss.post.get_solution_data(expressions="dB(S(1,1))", setup_sweep_name=setup_sweep)
-    if sol is None:
-        raise RuntimeError("未能提取 S11 曲线（get_solution_data 返回 None）。")
-    freqs = np.array(sol.primary_sweep_values, dtype=float)
-    s11_db = np.array(sol.data_real(), dtype=float)
-    if freqs.size == 0 or s11_db.size == 0:
-        raise RuntimeError("S11 曲线为空。")
-    return freqs, s11_db
+    setups = [f"{SETUP_NAME} : {SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
+    exprs = ["dB(S(1,1))", "S(1,1)"]
+    last_err = None
+    for ss in setups:
+        for ex in exprs:
+            try:
+                sol = hfss.post.get_solution_data(expressions=ex, setup_sweep_name=ss)
+                if sol is None:
+                    continue
+                freqs = np.array(sol.primary_sweep_values, dtype=float)
+                vals = np.array(sol.data_real(), dtype=float)
+                if freqs.size == 0 or vals.size == 0:
+                    continue
+                # 若不是 dB 表达式，则转 dB
+                if ex == "S(1,1)":
+                    vals = 20.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
+                return freqs, vals
+            except Exception as e:
+                last_err = e
+                continue
+    raise RuntimeError(f"未能提取 S11 曲线（检查 setup/sweep/表达式）。最后错误: {last_err}")
 
 
 def band_match_ok(freqs: np.ndarray, s11_db: np.ndarray, band: Tuple[float, float], threshold_db=-10.0):
@@ -152,23 +176,34 @@ def extract_gain_at_freq(hfss: Hfss, target_freq_ghz: float) -> float:
     提取指定频点增益（基于 Infinite Sphere1）。
     若场景表达式差异导致失败，返回 nan。
     """
-    setup_sweep = f"{SETUP_NAME} : {SWEEP_NAME}"
-    try:
-        sol = hfss.post.get_solution_data(
-            expressions="dB(GainTotal)",
-            setup_sweep_name=setup_sweep,
-            context=FAR_FIELD_SPHERE,
-        )
-        if sol is None:
-            return float("nan")
-        freqs = np.array(sol.primary_sweep_values, dtype=float)
-        vals = np.array(sol.data_real(), dtype=float)
-        if freqs.size == 0 or vals.size == 0:
-            return float("nan")
-        idx = int(np.argmin(np.abs(freqs - target_freq_ghz)))
-        return float(vals[idx])
-    except Exception:
-        return float("nan")
+    setups = [f"{SETUP_NAME} : {SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
+    exprs = ["dB(GainTotal)", "dB(RealizedGainTotal)", "GainTotal"]
+    contexts = [FAR_FIELD_SPHERE, "Infinite Sphere1", None]
+    last_err = None
+    for ss in setups:
+        for ex in exprs:
+            for ctx in contexts:
+                try:
+                    kwargs = {"expressions": ex, "setup_sweep_name": ss}
+                    if ctx is not None:
+                        kwargs["context"] = ctx
+                    sol = hfss.post.get_solution_data(**kwargs)
+                    if sol is None:
+                        continue
+                    freqs = np.array(sol.primary_sweep_values, dtype=float)
+                    vals = np.array(sol.data_real(), dtype=float)
+                    if freqs.size == 0 or vals.size == 0:
+                        continue
+                    # 若不是 dB 表达式则转 dB
+                    if ex == "GainTotal":
+                        vals = 10.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
+                    idx = int(np.argmin(np.abs(freqs - target_freq_ghz)))
+                    return float(vals[idx])
+                except Exception as e:
+                    last_err = e
+                    continue
+    print(f"[警告] 无法提取 {target_freq_ghz}GHz 增益，返回 NaN。最后错误: {last_err}")
+    return float("nan")
 
 
 def evaluate_design(hfss: Hfss, dv: DesignVariables) -> Dict:
@@ -178,8 +213,14 @@ def evaluate_design(hfss: Hfss, dv: DesignVariables) -> Dict:
       - 28/38GHz 增益
       - 双频段是否满足 |S11|<-10dB
     """
+    if STOP_REQUESTED:
+        raise KeyboardInterrupt("用户请求停止仿真。")
+
     apply_design_variables(hfss, dv)
     hfss.analyze_setup(SETUP_NAME)
+
+    if STOP_REQUESTED:
+        raise KeyboardInterrupt("用户请求停止仿真。")
 
     freqs, s11_db = get_s11_curve(hfss)
     b1_ok = band_match_ok(freqs, s11_db, BAND1, S11_THRESHOLD_DB)
@@ -301,12 +342,18 @@ def main():
         )
 
         for i in range(1, budget + 1):
+            if STOP_REQUESTED:
+                print("检测到中断请求，提前结束优化循环。")
+                break
             cand = optimizer.suggest(1)[0]
             dv = DesignVariables(**{**asdict(default_vars), **cand})
             try:
                 result = evaluate_design(hfss, dv)
                 loss = objective_from_result(result)
                 success = True
+            except KeyboardInterrupt:
+                print("仿真被用户中断，保存当前结果并退出。")
+                break
             except Exception as e:
                 result = {
                     "design_vars": asdict(dv),
