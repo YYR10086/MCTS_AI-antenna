@@ -26,7 +26,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from pyaedt import Hfss
+try:
+    from ansys.aedt.core import Hfss
+except Exception:  # noqa: BLE001
+    from pyaedt import Hfss
 
 try:
     from tqdm import tqdm
@@ -45,6 +48,7 @@ FAR_FIELD_SPHERE = "Infinite Sphere1"
 
 # 完整路径占位：请改为你的工程绝对路径，例如 r"D:\\hfss\\A1.aedt"
 PROJECT_PATH = r"<FULL_PATH_TO_YOUR_A1.aedt>"
+AUTO_REMOVE_LOCK = True
 
 BAND_1 = (26.0, 32.0)
 BAND_2 = (37.0, 39.0)
@@ -91,6 +95,49 @@ class AnalyzeHeartbeat:
             self._thread.join(timeout=1.0)
         elapsed = time.time() - self._start_time
         print(f"[PROGRESS] {self.tag} 结束，总耗时 {elapsed:.1f}s")
+
+
+def _request_aedt_stop(hfss: Hfss) -> None:
+    """尽力请求 AEDT 停止当前仿真。"""
+    stop_calls = [
+        ("hfss.stop_simulations", lambda: hfss.stop_simulations()),
+        ("hfss.odesktop.StopSimulations", lambda: hfss.odesktop.StopSimulations()),
+        ("hfss.desktop_class.odesktop.StopSimulations", lambda: hfss.desktop_class.odesktop.StopSimulations()),
+    ]
+    for tag, fn in stop_calls:
+        try:
+            fn()
+            print(f"[INTERRUPT] 已发送停止命令: {tag}")
+            return
+        except Exception:
+            continue
+    print("[INTERRUPT] 未找到可用停止接口，请等待当前求解步结束。")
+
+
+def _run_analyze_with_interrupt(hfss: Hfss, setup_name: str) -> None:
+    """
+    在后台线程执行 analyze_setup，主线程轮询中断并尝试停止 AEDT 求解。
+    """
+    box: dict[str, Any] = {"exc": None}
+
+    def _target():
+        try:
+            hfss.analyze_setup(setup_name)
+        except Exception as exc:  # noqa: BLE001
+            box["exc"] = exc
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+
+    while thread.is_alive():
+        if STOP_REQUESTED:
+            _request_aedt_stop(hfss)
+            thread.join(timeout=8.0)
+            raise KeyboardInterrupt("用户中断：已请求停止 HFSS 仿真。")
+        thread.join(timeout=1.0)
+
+    if box["exc"] is not None:
+        raise box["exc"]
 
 
 @dataclass
@@ -189,6 +236,28 @@ def _apply_design_variables(hfss: Hfss, variables: DesignVariables) -> None:
         hfss[name] = f"{value:.6f}mm"
 
 
+def _possible_lock_files(project_file: Path) -> list[Path]:
+    stem = project_file.stem
+    parent = project_file.parent
+    return [
+        Path(str(project_file) + ".lock"),
+        parent / f"{stem}.lock",
+    ]
+
+
+def _remove_project_lock(project_file: Path) -> bool:
+    removed = False
+    for lock_file in _possible_lock_files(project_file):
+        if lock_file.exists():
+            try:
+                lock_file.unlink()
+                print(f"[LOCK] 已移除锁文件: {lock_file}")
+                removed = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[LOCK] 锁文件删除失败: {lock_file}, err={exc}")
+    return removed
+
+
 def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
     """
     兼容不同 PyAEDT 版本的 Hfss 构造参数。
@@ -205,7 +274,8 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
                 "design": DESIGN_NAME,
                 "version": version,
                 "non_graphical": non_graphical,
-                "new_desktop_session": False,
+                "new_desktop": False,
+                "remove_lock": False,
             },
         ),
         (
@@ -215,7 +285,8 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
                 "designname": DESIGN_NAME,
                 "specified_version": version,
                 "non_graphical": non_graphical,
-                "new_desktop_session": False,
+                "new_desktop": False,
+                "remove_lock": False,
             },
         ),
         (
@@ -224,17 +295,47 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
                 "projectname": str(project_file),
                 "designname": DESIGN_NAME,
                 "non_graphical": non_graphical,
-                "new_desktop_session": False,
+                "new_desktop": False,
+                "remove_lock": False,
+            },
+        ),
+        (
+            "new_signature_remove_lock",
+            {
+                "project": str(project_file),
+                "design": DESIGN_NAME,
+                "version": version,
+                "non_graphical": non_graphical,
+                "new_desktop": False,
+                "remove_lock": True,
             },
         ),
     ]
 
     errors: list[str] = []
+    saw_lock_error = False
     for tag, kwargs in attempts:
         try:
             return Hfss(**kwargs)
         except Exception as exc:  # noqa: BLE001
+            if "Project is locked" in str(exc):
+                saw_lock_error = True
             errors.append(f"{tag}: {exc}")
+
+    if saw_lock_error and AUTO_REMOVE_LOCK and _remove_project_lock(project_file):
+        print("[LOCK] 检测到项目锁，移除后重试 HFSS 连接。")
+        retry_kwargs = {
+            "project": str(project_file),
+            "design": DESIGN_NAME,
+            "version": version,
+            "non_graphical": non_graphical,
+            "new_desktop": False,
+            "remove_lock": True,
+        }
+        try:
+            return Hfss(**retry_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"retry_after_remove_lock: {exc}")
 
     joined = " | ".join(errors)
     raise RuntimeError(
@@ -330,7 +431,7 @@ def run_single_simulation(
         if STOP_REQUESTED:
             raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
         with AnalyzeHeartbeat(tag=f"HFSS analyze_setup({SETUP_NAME})", interval_sec=30):
-            hfss.analyze_setup(SETUP_NAME)
+            _run_analyze_with_interrupt(hfss, SETUP_NAME)
         if STOP_REQUESTED:
             raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
 
@@ -450,7 +551,16 @@ def run_optimization(
 
         index_iter = range(1, budget + 1)
         if tqdm is not None:
-            index_iter = tqdm(index_iter, total=budget, desc="HFSS Optimization", unit="iter")
+            index_iter = tqdm(
+                index_iter,
+                total=budget,
+                desc="HFSS Optimization",
+                unit="iter",
+                dynamic_ncols=True,
+                leave=True,
+            )
+        else:
+            print("[PROGRESS] 未安装 tqdm，使用普通文本进度输出。可执行: pip install tqdm")
 
         for i in index_iter:
             if STOP_REQUESTED:
