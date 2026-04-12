@@ -189,6 +189,60 @@ def _apply_design_variables(hfss: Hfss, variables: DesignVariables) -> None:
         hfss[name] = f"{value:.6f}mm"
 
 
+def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
+    """
+    兼容不同 PyAEDT 版本的 Hfss 构造参数。
+
+    说明：
+    - 新版常见参数：project/design/version
+    - 旧版常见参数：projectname/designname/specified_version
+    """
+    attempts: list[tuple[str, dict[str, Any]]] = [
+        (
+            "new_signature",
+            {
+                "project": str(project_file),
+                "design": DESIGN_NAME,
+                "version": version,
+                "non_graphical": non_graphical,
+                "new_desktop_session": False,
+            },
+        ),
+        (
+            "legacy_signature",
+            {
+                "projectname": str(project_file),
+                "designname": DESIGN_NAME,
+                "specified_version": version,
+                "non_graphical": non_graphical,
+                "new_desktop_session": False,
+            },
+        ),
+        (
+            "legacy_without_version",
+            {
+                "projectname": str(project_file),
+                "designname": DESIGN_NAME,
+                "non_graphical": non_graphical,
+                "new_desktop_session": False,
+            },
+        ),
+    ]
+
+    errors: list[str] = []
+    for tag, kwargs in attempts:
+        try:
+            return Hfss(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{tag}: {exc}")
+
+    joined = " | ".join(errors)
+    raise RuntimeError(
+        "无法初始化 Hfss 会话。请检查 PyAEDT 版本与参数签名。"
+        f" 已尝试: {joined}"
+    )
+
+
 def _get_s11_curve(hfss: Hfss) -> tuple[np.ndarray, np.ndarray]:
     setup_candidates = [f"{SETUP_NAME} : {SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
     expression_candidates = ["dB(S(1,1))", "S(1,1)"]
@@ -270,13 +324,7 @@ def run_single_simulation(
 
     hfss = None
     try:
-        hfss = Hfss(
-            project=str(project_file),
-            design=DESIGN_NAME,
-            new_desktop_session=False,
-            non_graphical=non_graphical,
-            version=version,
-        )
+        hfss = _create_hfss_session(project_file, non_graphical=non_graphical, version=version)
 
         _apply_design_variables(hfss, design_vars)
         if STOP_REQUESTED:
@@ -319,6 +367,8 @@ def run_single_simulation(
         if hfss is not None:
             try:
                 hfss.release_desktop(close_projects=False, close_desktop=False)
+            except TypeError:
+                hfss.release_desktop()
             except Exception:
                 pass
 
