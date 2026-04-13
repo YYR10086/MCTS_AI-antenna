@@ -58,7 +58,13 @@ BAND_2 = (37.0, 39.0)
 TARGET_FREQS = (28.0, 38.0)
 S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
-PARAM_SAFE_LB = {"dp": 0.25, "x1": 1.1, "y1": 1.1}
+PARAM_SAFE_LB = {
+    "dp": 0.3,
+    "x1": 1.3,
+    "y1": 1.3,
+    "S": 0.8,
+    "Rc": 6.0,
+}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
@@ -788,11 +794,11 @@ def run_optimization(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     api_config = {
-        "Rc": {"type": "real", "space": "linear", "range": (5.5, 7.5)},
-        "S": {"type": "real", "space": "linear", "range": (0.6, 1.8)},
-        "dp": {"type": "real", "space": "linear", "range": (0.2, 0.7)},
-        "x1": {"type": "real", "space": "linear", "range": (1.0, 2.5)},
-        "y1": {"type": "real", "space": "linear", "range": (1.0, 2.2)},
+        "Rc": {"type": "real", "space": "linear", "range": (6.0, 7.5)},
+        "S": {"type": "real", "space": "linear", "range": (0.8, 1.8)},
+        "dp": {"type": "real", "space": "linear", "range": (0.3, 0.7)},
+        "x1": {"type": "real", "space": "linear", "range": (1.3, 2.5)},
+        "y1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
     }
     optimizer = build_optimizer(api_config)
 
