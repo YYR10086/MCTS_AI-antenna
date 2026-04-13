@@ -405,6 +405,43 @@ def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
     return float("nan")
 
 
+def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> dict[str, Any]:
+    """在已打开的 HFSS 会话中评估一次设计。"""
+    _apply_design_variables(hfss, design_vars)
+    if STOP_REQUESTED:
+        raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
+    with AnalyzeHeartbeat(tag=f"HFSS analyze_setup({SETUP_NAME})", interval_sec=30):
+        _run_analyze_with_interrupt(hfss, SETUP_NAME)
+    if STOP_REQUESTED:
+        raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
+
+    freqs, s11_db = _get_s11_curve(hfss)
+    band1_ok = _band_ok(freqs, s11_db, BAND_1, S11_THRESHOLD_DB)
+    band2_ok = _band_ok(freqs, s11_db, BAND_2, S11_THRESHOLD_DB)
+
+    gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0])
+    gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1])
+
+    return {
+        "project_name": PROJECT_NAME,
+        "design_name": DESIGN_NAME,
+        "setup_name": SETUP_NAME,
+        "sweep_name": SWEEP_NAME,
+        "far_field_sphere": FAR_FIELD_SPHERE,
+        "project_path": project_path,
+        "design_vars": asdict(design_vars),
+        "s11_curve": {
+            "freq_ghz": freqs.tolist(),
+            "s11_db": s11_db.tolist(),
+        },
+        "gain_28ghz_db": gain_28,
+        "gain_38ghz_db": gain_38,
+        "band_26_32_ok": band1_ok,
+        "band_37_39_ok": band2_ok,
+        "dualband_match_ok": bool(band1_ok and band2_ok),
+    }
+
+
 def run_single_simulation(
     project_path: str,
     design_vars: DesignVariables,
@@ -426,40 +463,7 @@ def run_single_simulation(
     hfss = None
     try:
         hfss = _create_hfss_session(project_file, non_graphical=non_graphical, version=version)
-
-        _apply_design_variables(hfss, design_vars)
-        if STOP_REQUESTED:
-            raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
-        with AnalyzeHeartbeat(tag=f"HFSS analyze_setup({SETUP_NAME})", interval_sec=30):
-            _run_analyze_with_interrupt(hfss, SETUP_NAME)
-        if STOP_REQUESTED:
-            raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
-
-        freqs, s11_db = _get_s11_curve(hfss)
-        band1_ok = _band_ok(freqs, s11_db, BAND_1, S11_THRESHOLD_DB)
-        band2_ok = _band_ok(freqs, s11_db, BAND_2, S11_THRESHOLD_DB)
-
-        gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0])
-        gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1])
-
-        return {
-            "project_name": PROJECT_NAME,
-            "design_name": DESIGN_NAME,
-            "setup_name": SETUP_NAME,
-            "sweep_name": SWEEP_NAME,
-            "far_field_sphere": FAR_FIELD_SPHERE,
-            "project_path": str(project_file),
-            "design_vars": asdict(design_vars),
-            "s11_curve": {
-                "freq_ghz": freqs.tolist(),
-                "s11_db": s11_db.tolist(),
-            },
-            "gain_28ghz_db": gain_28,
-            "gain_38ghz_db": gain_38,
-            "band_26_32_ok": band1_ok,
-            "band_37_39_ok": band2_ok,
-            "dualband_match_ok": bool(band1_ok and band2_ok),
-        }
+        return _evaluate_with_open_hfss(hfss, design_vars, str(project_file))
     except Exception as exc:  # noqa: BLE001
         if isinstance(exc, KeyboardInterrupt):
             raise
@@ -535,102 +539,121 @@ def run_optimization(
     best_loss = float("inf")
     default_vars = DesignVariables()
 
-    with open(iter_csv, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "iter",
-                "loss",
-                "gain_28ghz_db",
-                "gain_38ghz_db",
-                "dualband_match_ok",
-                "design_vars_json",
-                "error",
-            ]
-        )
+    hfss = None
+    project_file = Path(project_path)
+    if not project_file.exists():
+        raise FileNotFoundError(f"HFSS 工程不存在: {project_file}")
 
-        index_iter = range(1, budget + 1)
-        if tqdm is not None:
-            index_iter = tqdm(
-                index_iter,
-                total=budget,
-                desc="HFSS Optimization",
-                unit="iter",
-                dynamic_ncols=True,
-                leave=True,
-            )
-        else:
-            print("[PROGRESS] 未安装 tqdm，使用普通文本进度输出。可执行: pip install tqdm")
+    try:
+        hfss = _create_hfss_session(project_file, non_graphical=True, version="2025.1")
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"优化前 HFSS 会话初始化失败: {exc}") from exc
 
-        for i in index_iter:
-            if STOP_REQUESTED:
-                print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
-                break
-            cand = optimizer.suggest(1)[0]
-            vars_i = DesignVariables(**{**asdict(default_vars), **cand})
-
-            err_msg = ""
-            try:
-                result = run_single_simulation(project_path=project_path, design_vars=vars_i)
-                loss = _objective(result)
-            except KeyboardInterrupt:
-                print("[INTERRUPT] 单次仿真被用户中断，结束优化并保留已有结果。")
-                break
-            except Exception as exc:  # noqa: BLE001
-                result = {
-                    "design_vars": asdict(vars_i),
-                    "s11_curve": {"freq_ghz": [], "s11_db": []},
-                    "gain_28ghz_db": float("nan"),
-                    "gain_38ghz_db": float("nan"),
-                    "dualband_match_ok": False,
-                }
-                loss = 1e6
-                err_msg = str(exc)
-
-            optimizer.observe([cand], [loss])
-
+    try:
+        with open(iter_csv, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
             writer.writerow(
                 [
-                    i,
-                    loss,
-                    result.get("gain_28ghz_db", float("nan")),
-                    result.get("gain_38ghz_db", float("nan")),
-                    int(bool(result.get("dualband_match_ok", False))),
-                    json.dumps(result.get("design_vars", {}), ensure_ascii=False),
-                    err_msg,
+                    "iter",
+                    "loss",
+                    "gain_28ghz_db",
+                    "gain_38ghz_db",
+                    "dualband_match_ok",
+                    "design_vars_json",
+                    "error",
                 ]
             )
 
-            if not err_msg and loss < best_loss:
-                best_loss = loss
-                best_result = result
+            index_iter = range(1, budget + 1)
+            if tqdm is not None:
+                index_iter = tqdm(
+                    index_iter,
+                    total=budget,
+                    desc="HFSS Optimization",
+                    unit="iter",
+                    dynamic_ncols=True,
+                    leave=True,
+                )
+            else:
+                print("[PROGRESS] 未安装 tqdm，使用普通文本进度输出。可执行: pip install tqdm")
 
-            print(
-                f"[{i}/{budget}] loss={loss:.4f} dualband={result.get('dualband_match_ok', False)} "
-                f"g28={result.get('gain_28ghz_db')} g38={result.get('gain_38ghz_db')}"
-            )
-            if tqdm is not None and hasattr(index_iter, "set_postfix"):
-                index_iter.set_postfix(
-                    loss=f"{loss:.3f}",
-                    dual=bool(result.get("dualband_match_ok", False)),
+            for i in index_iter:
+                if STOP_REQUESTED:
+                    print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
+                    break
+                cand = optimizer.suggest(1)[0]
+                vars_i = DesignVariables(**{**asdict(default_vars), **cand})
+
+                err_msg = ""
+                try:
+                    result = _evaluate_with_open_hfss(hfss, vars_i, str(project_file))
+                    loss = _objective(result)
+                except KeyboardInterrupt:
+                    print("[INTERRUPT] 单次仿真被用户中断，结束优化并保留已有结果。")
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    result = {
+                        "design_vars": asdict(vars_i),
+                        "s11_curve": {"freq_ghz": [], "s11_db": []},
+                        "gain_28ghz_db": float("nan"),
+                        "gain_38ghz_db": float("nan"),
+                        "dualband_match_ok": False,
+                    }
+                    loss = 1e6
+                    err_msg = str(exc)
+
+                optimizer.observe([cand], [loss])
+
+                writer.writerow(
+                    [
+                        i,
+                        loss,
+                        result.get("gain_28ghz_db", float("nan")),
+                        result.get("gain_38ghz_db", float("nan")),
+                        int(bool(result.get("dualband_match_ok", False))),
+                        json.dumps(result.get("design_vars", {}), ensure_ascii=False),
+                        err_msg,
+                    ]
                 )
 
-    if best_result is None:
-        final = {
-            "message": "没有成功仿真样本",
-            "project_path": project_path,
-            "optimizer": type(optimizer).__name__,
-        }
-    else:
-        final = {
-            "best_loss": best_loss,
-            "optimizer": type(optimizer).__name__,
-            **best_result,
-        }
-        _export_s11_csv(final, str(best_s11_csv))
+                if not err_msg and loss < best_loss:
+                    best_loss = loss
+                    best_result = result
 
-    with open(best_json, "w", encoding="utf-8") as f:
-        json.dump(final, f, ensure_ascii=False, indent=2)
+                print(
+                    f"[{i}/{budget}] loss={loss:.4f} dualband={result.get('dualband_match_ok', False)} "
+                    f"g28={result.get('gain_28ghz_db')} g38={result.get('gain_38ghz_db')}"
+                )
+                if tqdm is not None and hasattr(index_iter, "set_postfix"):
+                    index_iter.set_postfix(
+                        loss=f"{loss:.3f}",
+                        dual=bool(result.get("dualband_match_ok", False)),
+                    )
+
+        if best_result is None:
+            final = {
+                "message": "没有成功仿真样本",
+                "project_path": project_path,
+                "optimizer": type(optimizer).__name__,
+            }
+        else:
+            final = {
+                "best_loss": best_loss,
+                "optimizer": type(optimizer).__name__,
+                **best_result,
+            }
+            _export_s11_csv(final, str(best_s11_csv))
+
+        with open(best_json, "w", encoding="utf-8") as f:
+            json.dump(final, f, ensure_ascii=False, indent=2)
+    finally:
+        if hfss is not None:
+            try:
+                hfss.release_desktop(close_projects=False, close_desktop=False)
+            except TypeError:
+                hfss.release_desktop()
+            except Exception:
+                pass
 
     return {
         "best_result_json": str(best_json),
