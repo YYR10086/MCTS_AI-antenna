@@ -258,6 +258,62 @@ def _remove_project_lock(project_file: Path) -> bool:
     return removed
 
 
+def _attach_existing_hfss(project_file: Path, non_graphical: bool, version: str):
+    """
+    当 Hfss(...) 构造触发 `__init__ should return None, not 'bool'` 时，
+    尝试附着到已打开的 Desktop + Project + Design。
+    """
+    project_name = project_file.stem
+    candidates: list[tuple[str, Any]] = []
+    try:
+        from ansys.aedt.core import Desktop, get_pyaedt_app  # type: ignore
+
+        candidates.append(("ansys.aedt.core", (Desktop, get_pyaedt_app)))
+    except Exception:
+        pass
+    try:
+        from pyaedt import Desktop, get_pyaedt_app  # type: ignore
+
+        candidates.append(("pyaedt", (Desktop, get_pyaedt_app)))
+    except Exception:
+        pass
+
+    attach_errors: list[str] = []
+    for source, (Desktop, get_pyaedt_app) in candidates:
+        try:
+            # 先连接/复用已有 Desktop 会话。
+            try:
+                Desktop(new_desktop=False, non_graphical=non_graphical, version=version)
+            except TypeError:
+                Desktop(new_desktop_session=False, non_graphical=non_graphical, specified_version=version)
+
+            # 再尝试附着应用对象（多种签名都试）。
+            call_variants = [
+                {"project_name": project_name, "design_name": DESIGN_NAME},
+                {"project": project_name, "design": DESIGN_NAME},
+                {"project_name": str(project_file), "design_name": DESIGN_NAME},
+                {"project": str(project_file), "design": DESIGN_NAME},
+                {"projectname": project_name, "designname": DESIGN_NAME},
+                {},
+            ]
+            for kwargs in call_variants:
+                try:
+                    app = get_pyaedt_app(**kwargs) if kwargs else get_pyaedt_app()
+                    if app is not None:
+                        if hasattr(app, "set_active_design"):
+                            try:
+                                app.set_active_design(DESIGN_NAME)
+                            except Exception:
+                                pass
+                        return app
+                except Exception as e:  # noqa: BLE001
+                    attach_errors.append(f"{source}.get_pyaedt_app({kwargs}): {e}")
+        except Exception as e:  # noqa: BLE001
+            attach_errors.append(f"{source}.Desktop attach failed: {e}")
+
+    raise RuntimeError("附着已打开 HFSS 会话失败: " + " | ".join(attach_errors))
+
+
 def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
     """
     兼容不同 PyAEDT 版本的 Hfss 构造参数。
@@ -336,6 +392,14 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
             return Hfss(**retry_kwargs)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"retry_after_remove_lock: {exc}")
+
+    # 某些 PyAEDT 版本在 __init__ 内部异常时会返回 False，触发该 TypeError。
+    # 这时尝试“附着到现有 Desktop 会话”作为兜底。
+    if all("__init__() should return None, not 'bool'" in e for e in errors):
+        try:
+            return _attach_existing_hfss(project_file, non_graphical=non_graphical, version=version)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"attach_existing: {exc}")
 
     joined = " | ".join(errors)
     raise RuntimeError(
