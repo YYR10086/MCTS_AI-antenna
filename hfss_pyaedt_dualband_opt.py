@@ -47,8 +47,8 @@ SETUP_NAME = "Setup1"
 SWEEP_NAME = "Sweep"
 FAR_FIELD_SPHERE = "Infinite Sphere1"
 
-# 完整路径占位：请改为你的工程绝对路径，例如 r"D:\\hfss\\A1.aedt"
-PROJECT_PATH = r"<FULL_PATH_TO_YOUR_A1.aedt>"
+# 默认读取脚本同目录下的 A1.aedt
+PROJECT_PATH = str(Path(__file__).parent / "A1.aedt")
 AUTO_REMOVE_LOCK = True
 
 BAND_1 = (26.0, 32.0)
@@ -350,6 +350,10 @@ def _attach_existing_hfss(project_file: Path, non_graphical: bool, version: str)
 
 
 def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
+    project_file = Path(project_file).resolve()
+    if not project_file.exists():
+        raise FileNotFoundError(f"HFSS 工程文件不存在: {project_file}")
+
     lock_file = str(project_file) + ".lock"
     if os.path.exists(lock_file):
         try:
@@ -367,6 +371,29 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
             non_graphical=non_graphical,
             new_desktop=False,
         )
+    except TypeError as first_exc:
+        print(f"[ERROR] Hfss.__init__ 返回非None，project路径={project_file}，请检查路径和AEDT版本")
+        time.sleep(5)
+        try:
+            return Hfss(
+                project=str(project_file),
+                design=DESIGN_NAME,
+                version=version,
+                non_graphical=non_graphical,
+                new_desktop=False,
+                remove_lock=True,
+            )
+        except TypeError as second_exc:
+            print(f"[ERROR] Hfss.__init__ 返回非None，project路径={project_file}，请检查路径和AEDT版本")
+            raise RuntimeError(
+                "无法初始化 Hfss 会话。first_try="
+                f"{first_exc}; second_try={second_exc}"
+            ) from second_exc
+        except Exception as second_exc:  # noqa: BLE001
+            raise RuntimeError(
+                "无法初始化 Hfss 会话。first_try="
+                f"{first_exc}; second_try={second_exc}"
+            ) from second_exc
     except Exception as first_exc:  # noqa: BLE001
         time.sleep(5)
         try:
@@ -378,6 +405,12 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
                 new_desktop=False,
                 remove_lock=True,
             )
+        except TypeError as second_exc:
+            print(f"[ERROR] Hfss.__init__ 返回非None，project路径={project_file}，请检查路径和AEDT版本")
+            raise RuntimeError(
+                "无法初始化 Hfss 会话。first_try="
+                f"{first_exc}; second_try={second_exc}"
+            ) from second_exc
         except Exception as second_exc:  # noqa: BLE001
             raise RuntimeError(
                 "无法初始化 Hfss 会话。first_try="
@@ -627,7 +660,7 @@ def run_single_simulation(
     if STOP_REQUESTED:
         raise KeyboardInterrupt("检测到用户中断请求，跳过本次仿真。")
 
-    project_file = Path(project_path)
+    project_file = Path(project_path).resolve()
     if not project_file.exists():
         raise FileNotFoundError(f"HFSS 工程不存在: {project_file}")
 
@@ -712,7 +745,7 @@ def run_optimization(
     best_loss = float("inf")
     default_vars = DesignVariables()
 
-    project_file = Path(project_path)
+    project_file = Path(project_path).resolve()
     if not project_file.exists():
         raise FileNotFoundError(f"HFSS 工程不存在: {project_file}")
 
