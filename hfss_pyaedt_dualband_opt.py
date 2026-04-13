@@ -392,18 +392,21 @@ def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
         hfss.save_project()
     except Exception:
         pass
-    try:
-        hfss.release_desktop(close_projects=False, close_on_exit=False)
-    except TypeError:
+    released = False
+    release_calls = [
+        lambda: hfss.release_desktop(close_projects=False, close_desktop=False),
+        lambda: hfss.release_desktop(close_projects=False),
+        lambda: hfss.release_desktop(),
+    ]
+    for call in release_calls:
         try:
-            hfss.release_desktop(close_projects=False, close_desktop=False)
+            call()
+            released = True
+            break
         except Exception:
-            try:
-                hfss.release_desktop()
-            except Exception:
-                pass
-    except Exception:
-        pass
+            continue
+    if not released:
+        logging.warning("release_desktop 全部调用方式失败，已静默跳过。")
     time.sleep(sleep_sec)
 
 
