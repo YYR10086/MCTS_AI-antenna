@@ -19,7 +19,9 @@ import json
 import logging
 import math
 import os
+import platform
 import signal
+import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -69,6 +71,24 @@ def _request_stop(signum, _frame) -> None:
 
 signal.signal(signal.SIGINT, _request_stop)
 signal.signal(signal.SIGTERM, _request_stop)
+
+
+def _kill_stale_aedt() -> None:
+    """强制结束所有残留的 AEDT 进程（仅 Windows）。"""
+    if platform.system() != "Windows":
+        return
+    targets = ["ansysedt.exe", "ansysedtsv.exe"]
+    for name in targets:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"[CLEANUP] 已结束残留进程: {name}")
+        except Exception:
+            pass
+    time.sleep(3)
 
 
 class AnalyzeHeartbeat:
@@ -385,7 +405,7 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
             design=DESIGN_NAME,
             version=version,
             non_graphical=non_graphical,
-            new_desktop=False,
+            new_desktop=True,
         )
     except TypeError as first_exc:
         print(f"[ERROR] Hfss.__init__ 返回非None，project路径={project_file}，请检查路径和AEDT版本")
@@ -396,7 +416,7 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
                 design=DESIGN_NAME,
                 version=version,
                 non_graphical=non_graphical,
-                new_desktop=False,
+                new_desktop=True,
                 remove_lock=True,
             )
         except TypeError as second_exc:
@@ -418,7 +438,7 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
                 design=DESIGN_NAME,
                 version=version,
                 non_graphical=non_graphical,
-                new_desktop=False,
+                new_desktop=True,
                 remove_lock=True,
             )
         except TypeError as second_exc:
@@ -922,6 +942,7 @@ def run_optimization(
 
 def main() -> None:
     try:
+        _kill_stale_aedt()
         # 1) 单次仿真（用默认参数）
         one_shot = run_single_simulation(
             project_path=PROJECT_PATH,
