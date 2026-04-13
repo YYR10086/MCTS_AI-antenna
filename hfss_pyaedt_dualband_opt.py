@@ -56,6 +56,7 @@ BAND_2 = (37.0, 39.0)
 TARGET_FREQS = (28.0, 38.0)
 S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
+PARAM_SAFE_LB = {"dp": 0.25, "x1": 1.1, "y1": 1.1}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
@@ -139,6 +140,13 @@ def _run_analyze_with_interrupt(hfss: Hfss, setup_name: str) -> None:
         thread.join(timeout=1.0)
 
     if box["exc"] is not None:
+        print("[DIAG] Setup求解失败，尝试获取HFSS消息日志...")
+        try:
+            msgs = hfss.odesktop.GetMessages("", "", 2)
+            for m in (msgs or [])[-10:]:
+                print(f"[HFSS MSG] {m}")
+        except Exception:
+            pass
         raise box["exc"]
 
 
@@ -267,6 +275,11 @@ def validate_params(params: dict[str, float], api_config: dict[str, dict[str, An
         if clipped != float(v):
             logging.warning("参数 %s 越界: %.6f -> clip 到 %.6f (范围 %.6f~%.6f)", k, float(v), clipped, lb, ub)
         fixed[k] = clipped
+
+    for k, safe_lb in PARAM_SAFE_LB.items():
+        if k in fixed and fixed[k] < safe_lb:
+            logging.warning("参数 %s 值 %.4f 低于安全下界 %.4f，强制提升", k, fixed[k], safe_lb)
+            fixed[k] = float(safe_lb)
     return fixed
 
 
@@ -497,6 +510,14 @@ def _peak_from_solution(sol: Any, math_formula: str | None = None) -> float | No
     return float(np.nanmax(vals))
 
 
+def _check_geometry_valid(hfss: Hfss) -> bool:
+    try:
+        _ = hfss.odesign.GetChildObject("Model").GetChildNames()
+        return True
+    except Exception:
+        return False
+
+
 def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
     preferred_setup = f"{SETUP_NAME} : {SWEEP_NAME}"
     setup_candidates = [preferred_setup, f"{SETUP_NAME}:{SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
@@ -612,6 +633,16 @@ def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
 def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> dict[str, Any]:
     """在已打开的 HFSS 会话中评估一次设计。"""
     _apply_design_variables(hfss, design_vars)
+    try:
+        hfss.delete_solution_data()
+    except Exception:
+        pass
+    try:
+        hfss.odesign.DeleteFullVariation("All", False)
+    except Exception:
+        pass
+    if not _check_geometry_valid(hfss):
+        raise RuntimeError("几何模型无效，跳过本轮仿真")
     if STOP_REQUESTED:
         raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
     with AnalyzeHeartbeat(tag=f"HFSS analyze_setup({SETUP_NAME})", interval_sec=30):
