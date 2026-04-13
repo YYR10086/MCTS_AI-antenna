@@ -298,10 +298,7 @@ def _attach_existing_hfss(project_file: Path, non_graphical: bool, version: str)
     for source, (Desktop, get_pyaedt_app) in candidates:
         try:
             # 先连接/复用已有 Desktop 会话。
-            try:
-                Desktop(new_desktop=False, non_graphical=non_graphical, version=version)
-            except TypeError:
-                Desktop(new_desktop_session=False, non_graphical=non_graphical, specified_version=version)
+            Desktop(new_desktop=False, non_graphical=non_graphical, version=version)
 
             # 再尝试附着应用对象（多种签名都试）。
             call_variants = [
@@ -309,7 +306,6 @@ def _attach_existing_hfss(project_file: Path, non_graphical: bool, version: str)
                 {"project": project_name, "design": DESIGN_NAME},
                 {"project_name": str(project_file), "design_name": DESIGN_NAME},
                 {"project": str(project_file), "design": DESIGN_NAME},
-                {"projectname": project_name, "designname": DESIGN_NAME},
                 {},
             ]
             for kwargs in call_variants:
@@ -334,13 +330,11 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
     """
     兼容不同 PyAEDT 版本的 Hfss 构造参数。
 
-    说明：
-    - 新版常见参数：project/design/version
-    - 旧版常见参数：projectname/designname/specified_version
+    说明：统一使用新参数 project/design/version，减少 0.17.5 的弃用/兼容噪声。
     """
     attempts: list[tuple[str, dict[str, Any]]] = [
         (
-            "new_signature",
+            "reuse_desktop",
             {
                 "project": str(project_file),
                 "design": DESIGN_NAME,
@@ -351,28 +345,18 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
             },
         ),
         (
-            "legacy_signature",
+            "new_desktop_fresh",
             {
-                "projectname": str(project_file),
-                "designname": DESIGN_NAME,
-                "specified_version": version,
+                "project": str(project_file),
+                "design": DESIGN_NAME,
+                "version": version,
                 "non_graphical": non_graphical,
-                "new_desktop": False,
+                "new_desktop": True,
                 "remove_lock": False,
             },
         ),
         (
-            "legacy_without_version",
-            {
-                "projectname": str(project_file),
-                "designname": DESIGN_NAME,
-                "non_graphical": non_graphical,
-                "new_desktop": False,
-                "remove_lock": False,
-            },
-        ),
-        (
-            "new_signature_remove_lock",
+            "reuse_desktop_remove_lock",
             {
                 "project": str(project_file),
                 "design": DESIGN_NAME,
@@ -460,57 +444,149 @@ def _band_ok(freqs: np.ndarray, s11_db: np.ndarray, band: tuple[float, float], t
     return bool(np.any(mask) and np.all(s11_db[mask] < threshold))
 
 
-def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
-    setup_candidates = [
-        f"{SETUP_NAME} : {SWEEP_NAME}",
-        f"{SETUP_NAME}:{SWEEP_NAME}",
-        f"{SETUP_NAME} : LastAdaptive",
-        f"{SETUP_NAME}:LastAdaptive",
-        SETUP_NAME,
-    ]
-    # 避免触发历史工程里的 `gaintotal` 宏报错，仅使用 RealizedGainTotal。
-    expression_candidates = ["dB(RealizedGainTotal)", "RealizedGainTotal"]
-    context_candidates = [FAR_FIELD_SPHERE, "Infinite Sphere1", None]
-    fail_reasons: list[str] = []
-    freq_tag = f"{target_freq_ghz}GHz"
+def _build_farfield_variations(hfss: Hfss, freq_ghz: float) -> dict[str, list[str]]:
+    """构建 PyAEDT 0.17.5 可接受的 variations（不用 intrinsics）。"""
+    variations: dict[str, list[str]] = {}
+    try:
+        nominal = hfss.available_variations.nominal_values.copy()
+        for key, value in nominal.items():
+            if isinstance(value, list):
+                variations[key] = value
+            else:
+                variations[key] = [str(value)]
+    except Exception:
+        pass
 
-    query_variants = [
-        {"domain": "Sweep", "variations": {"Freq": [freq_tag], "Theta": ["All"], "Phi": ["All"]}},
-        {"variations": {"Freq": [freq_tag], "Theta": ["All"], "Phi": ["All"]}},
-        {"intrinsics": {"Freq": freq_tag, "Theta": "All", "Phi": "All"}},
-        {},
-    ]
+    variations["Freq"] = [f"{freq_ghz}GHz"]
+    variations["Theta"] = ["All"]
+    variations["Phi"] = ["All"]
+    return variations
+
+
+def _peak_from_solution(sol: Any, math_formula: str | None = None) -> float | None:
+    if sol is None or isinstance(sol, bool):
+        return None
+    try:
+        vals = np.asarray(sol.data_real(), dtype=float)
+    except Exception:
+        return None
+    if vals.size == 0:
+        return None
+    if math_formula == "dB":
+        vals = 10.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
+    return float(np.nanmax(vals))
+
+
+def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
+    preferred_setup = f"{SETUP_NAME} : {SWEEP_NAME}"
+    setup_candidates = [preferred_setup, f"{SETUP_NAME}:{SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
+    context = FAR_FIELD_SPHERE
+    fail_reasons: list[str] = []
+
+    # C) 先做可用量探测
+    report_types: list[str] = []
+    ff_quantities: list[str] = []
+    try:
+        report_types = list(getattr(hfss.post, "available_report_types", []) or [])
+    except Exception:
+        pass
+    print(f"[DEBUG] available report types: {report_types}")
 
     for setup in setup_candidates:
-        for expr in expression_candidates:
-            for context in context_candidates:
-                for qv in query_variants:
-                    try:
-                        kwargs = {"expressions": expr, "setup_sweep_name": setup}
-                        if context is not None:
-                            kwargs["context"] = context
-                        kwargs.update(qv)
+        try:
+            q = hfss.post.available_report_quantities(
+                report_category="Far Fields",
+                context=context,
+                setup_sweep_name=setup,
+            )
+            if q:
+                ff_quantities = list(q)
+                print(f"[DEBUG] far-field quantities @ {setup}: {ff_quantities}")
+                break
+        except Exception as exc:  # noqa: BLE001
+            fail_reasons.append(f"probe_quantities@{setup}: {exc}")
 
-                        sol = hfss.post.get_solution_data(**kwargs)
-                        if sol is None or isinstance(sol, bool):
-                            fail_reasons.append(f"{setup}|{expr}|{context}|{qv}: empty-solution({type(sol).__name__})")
-                            continue
+    preferred_quantities = ["RealizedGainTotal", "GainTotal", "dB(RealizedGainTotal)", "dB(GainTotal)"]
+    expr_candidates = [q for q in preferred_quantities if q in ff_quantities] or preferred_quantities
 
-                        vals = np.array(sol.data_real(), dtype=float)
-                        if vals.size == 0:
-                            fail_reasons.append(f"{setup}|{expr}|{context}|{qv}: empty-values")
-                            continue
+    for setup in setup_candidates:
+        variations = _build_farfield_variations(hfss, target_freq_ghz)
+        primary = "Theta" if "Theta" in variations else ("Phi" if "Phi" in variations else None)
 
-                        if expr == "RealizedGainTotal":
-                            vals = 10.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
+        for expr in expr_candidates:
+            for math_formula in (None, "dB"):
+                if expr.startswith("dB(") and math_formula == "dB":
+                    continue
+                try:
+                    kwargs = {
+                        "expressions": expr,
+                        "setup_sweep_name": setup,
+                        "domain": "Sweep",
+                        "variations": variations,
+                        "report_category": "Far Fields",
+                        "context": context,
+                    }
+                    if primary is not None:
+                        kwargs["primary_sweep_variable"] = primary
+                    if math_formula is not None:
+                        kwargs["math_formula"] = math_formula
 
-                        # Far-field 数据主扫常常是 Theta/Phi；此时直接取该频点上的峰值增益。
-                        return float(np.nanmax(vals))
-                    except Exception as exc:  # noqa: BLE001
-                        fail_reasons.append(f"{setup}|{expr}|{context}|{qv}: {exc}")
+                    sol = hfss.post.get_solution_data(**kwargs)
+                    peak = _peak_from_solution(sol)
+                    if peak is not None:
+                        return peak
+                    fail_reasons.append(f"get_solution_data@{setup}|{expr}|{math_formula}: empty")
+                except Exception as exc:  # noqa: BLE001
+                    fail_reasons.append(f"get_solution_data@{setup}|{expr}|{math_formula}: {exc}")
 
-    tail = " | ".join(fail_reasons[-5:]) if fail_reasons else "unknown"
-    print(f"[WARN] 提取 {target_freq_ghz} GHz 增益失败，返回 NaN。recent={tail}")
+            # D fallback 1: get_solution_data_per_variation
+            try:
+                kwargs2 = {
+                    "expression": expr,
+                    "setup_sweep_name": setup,
+                    "domain": "Sweep",
+                    "variations": variations,
+                    "report_category": "Far Fields",
+                    "context": context,
+                }
+                if primary is not None:
+                    kwargs2["primary_sweep_variable"] = primary
+                per_var = hfss.post.get_solution_data_per_variation(**kwargs2)
+                if isinstance(per_var, dict):
+                    for obj in per_var.values():
+                        peak = _peak_from_solution(obj)
+                        if peak is not None:
+                            return peak
+                else:
+                    peak = _peak_from_solution(per_var)
+                    if peak is not None:
+                        return peak
+                fail_reasons.append(f"per_variation@{setup}|{expr}: empty")
+            except Exception as exc:  # noqa: BLE001
+                fail_reasons.append(f"per_variation@{setup}|{expr}: {exc}")
+
+    # D fallback 2: antenna export path
+    for getter_name in ("get_antenna_data",):
+        getter = getattr(getattr(hfss, "post", hfss), getter_name, None)
+        if getter is None:
+            getter = getattr(hfss, getter_name, None)
+        if getter is None:
+            continue
+        try:
+            ant = getter(
+                setup_sweep_name=preferred_setup,
+                sphere=context,
+                frequencies=[f"{target_freq_ghz}GHz"],
+            )
+            peak = _peak_from_solution(ant, math_formula="dB")
+            if peak is not None:
+                return peak
+            fail_reasons.append(f"antenna_data({getter_name}): empty")
+        except Exception as exc:  # noqa: BLE001
+            fail_reasons.append(f"antenna_data({getter_name}): {exc}")
+
+    tail = " | ".join(fail_reasons[-8:]) if fail_reasons else "unknown"
+    print(f"[WARN] 提取 {target_freq_ghz} GHz 增益失败，返回 NaN。diagnostic={tail}")
     return float("nan")
 
 
