@@ -125,7 +125,10 @@ def _run_analyze_with_interrupt(hfss: Hfss, setup_name: str) -> None:
 
     def _target():
         try:
-            hfss.analyze_setup(setup_name)
+            try:
+                hfss.analyze_setup(setup_name, use_auto_settings=False, num_cores=4)
+            except TypeError:
+                hfss.odesign.Analyze(setup_name)
         except Exception as exc:  # noqa: BLE001
             box["exc"] = exc
 
@@ -633,6 +636,11 @@ def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
 def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> dict[str, Any]:
     """在已打开的 HFSS 会话中评估一次设计。"""
     _apply_design_variables(hfss, design_vars)
+    try:
+        hfss.save_project()
+    except Exception:
+        pass
+    time.sleep(1)
     try:
         hfss.delete_solution_data()
     except Exception:
