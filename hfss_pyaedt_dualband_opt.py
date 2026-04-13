@@ -174,6 +174,21 @@ def _ensure_numpy_compat() -> None:
         np.bool_ = bool  # type: ignore[attr-defined]
 
 
+def _ensure_sklearn_compat() -> None:
+    """兼容旧优化器对 sklearn.datasets.load_boston 的硬依赖。"""
+    try:
+        import sklearn.datasets as sk_datasets  # type: ignore
+    except Exception:
+        return
+    if hasattr(sk_datasets, "load_boston"):
+        return
+
+    def _fake_load_boston(*_args, **_kwargs):
+        raise RuntimeError("load_boston is unavailable; compatibility shim injected by hfss_pyaedt_dualband_opt.py")
+
+    sk_datasets.load_boston = _fake_load_boston  # type: ignore[attr-defined]
+
+
 class FallbackRandomOptimizer:
     """当 bayesmark/optimizer 导入失败时的兜底优化器。"""
 
@@ -217,6 +232,7 @@ def _patch_optimizer_config(optimizer_cls: type) -> None:
 def build_optimizer(api_config: dict[str, dict[str, Any]]):
     """优先加载当前仓库 optimizer.py（含 turbo1.py）。"""
     _ensure_numpy_compat()
+    _ensure_sklearn_compat()
     try:
         import optimizer as local_optimizer
 
@@ -409,7 +425,13 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
 
 
 def _get_s11_curve(hfss: Hfss) -> tuple[np.ndarray, np.ndarray]:
-    setup_candidates = [f"{SETUP_NAME} : {SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
+    setup_candidates = [
+        f"{SETUP_NAME} : {SWEEP_NAME}",
+        f"{SETUP_NAME}:{SWEEP_NAME}",
+        f"{SETUP_NAME} : LastAdaptive",
+        f"{SETUP_NAME}:LastAdaptive",
+        SETUP_NAME,
+    ]
     expression_candidates = ["dB(S(1,1))", "S(1,1)"]
     last_err: Exception | None = None
 
@@ -417,7 +439,7 @@ def _get_s11_curve(hfss: Hfss) -> tuple[np.ndarray, np.ndarray]:
         for expr in expression_candidates:
             try:
                 sol = hfss.post.get_solution_data(expressions=expr, setup_sweep_name=setup)
-                if sol is None:
+                if sol is None or isinstance(sol, bool) or not hasattr(sol, "primary_sweep_values"):
                     continue
                 freqs = np.array(sol.primary_sweep_values, dtype=float)
                 vals = np.array(sol.data_real(), dtype=float)
@@ -439,33 +461,56 @@ def _band_ok(freqs: np.ndarray, s11_db: np.ndarray, band: tuple[float, float], t
 
 
 def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
-    setup_candidates = [f"{SETUP_NAME} : {SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
-    expression_candidates = ["dB(GainTotal)", "dB(RealizedGainTotal)", "GainTotal"]
+    setup_candidates = [
+        f"{SETUP_NAME} : {SWEEP_NAME}",
+        f"{SETUP_NAME}:{SWEEP_NAME}",
+        f"{SETUP_NAME} : LastAdaptive",
+        f"{SETUP_NAME}:LastAdaptive",
+        SETUP_NAME,
+    ]
+    # 避免触发历史工程里的 `gaintotal` 宏报错，仅使用 RealizedGainTotal。
+    expression_candidates = ["dB(RealizedGainTotal)", "RealizedGainTotal"]
     context_candidates = [FAR_FIELD_SPHERE, "Infinite Sphere1", None]
-    last_err: Exception | None = None
+    fail_reasons: list[str] = []
+    freq_tag = f"{target_freq_ghz}GHz"
+
+    query_variants = [
+        {"domain": "Sweep", "variations": {"Freq": [freq_tag], "Theta": ["All"], "Phi": ["All"]}},
+        {"variations": {"Freq": [freq_tag], "Theta": ["All"], "Phi": ["All"]}},
+        {"intrinsics": {"Freq": freq_tag, "Theta": "All", "Phi": "All"}},
+        {},
+    ]
 
     for setup in setup_candidates:
         for expr in expression_candidates:
             for context in context_candidates:
-                try:
-                    kwargs = {"expressions": expr, "setup_sweep_name": setup}
-                    if context is not None:
-                        kwargs["context"] = context
-                    sol = hfss.post.get_solution_data(**kwargs)
-                    if sol is None:
-                        continue
-                    freqs = np.array(sol.primary_sweep_values, dtype=float)
-                    vals = np.array(sol.data_real(), dtype=float)
-                    if freqs.size == 0 or vals.size == 0:
-                        continue
-                    if expr == "GainTotal":
-                        vals = 10.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
-                    idx = int(np.argmin(np.abs(freqs - target_freq_ghz)))
-                    return float(vals[idx])
-                except Exception as exc:  # noqa: BLE001
-                    last_err = exc
+                for qv in query_variants:
+                    try:
+                        kwargs = {"expressions": expr, "setup_sweep_name": setup}
+                        if context is not None:
+                            kwargs["context"] = context
+                        kwargs.update(qv)
 
-    print(f"[WARN] 提取 {target_freq_ghz} GHz 增益失败，返回 NaN。last={last_err}")
+                        sol = hfss.post.get_solution_data(**kwargs)
+                        if sol is None or isinstance(sol, bool):
+                            fail_reasons.append(f"{setup}|{expr}|{context}|{qv}: empty-solution({type(sol).__name__})")
+                            continue
+
+                        vals = np.array(sol.data_real(), dtype=float)
+                        if vals.size == 0:
+                            fail_reasons.append(f"{setup}|{expr}|{context}|{qv}: empty-values")
+                            continue
+
+                        if expr == "RealizedGainTotal":
+                            vals = 10.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
+
+                        # Far-field 数据主扫常常是 Theta/Phi；此时直接取该频点上的峰值增益。
+                        return float(np.nanmax(vals))
+                    except Exception as exc:  # noqa: BLE001
+                        fail_reasons.append(f"{setup}|{expr}|{context}|{qv}: {exc}")
+
+    tail = " | ".join(fail_reasons[-5:]) if fail_reasons else "unknown"
+    print(f"[WARN] 提取 {target_freq_ghz} GHz 增益失败，返回 NaN。recent={tail}")
     return float("nan")
 
 
