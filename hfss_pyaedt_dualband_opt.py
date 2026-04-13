@@ -178,15 +178,21 @@ def _ensure_sklearn_compat() -> None:
     """兼容旧优化器对 sklearn.datasets.load_boston 的硬依赖。"""
     try:
         import sklearn.datasets as sk_datasets  # type: ignore
-    except Exception:
+    except Exception as exc:
+        print(f"[WARN] sklearn 不可用，跳过 load_boston 兼容补丁: {exc}")
         return
-    if hasattr(sk_datasets, "load_boston"):
+
+    # 不能用 hasattr/getattr 访问 load_boston；在 sklearn>=1.2 会直接抛 ImportError。
+    if "load_boston" in vars(sk_datasets):
         return
 
     def _fake_load_boston(*_args, **_kwargs):
         raise RuntimeError("load_boston is unavailable; compatibility shim injected by hfss_pyaedt_dualband_opt.py")
 
-    sk_datasets.load_boston = _fake_load_boston  # type: ignore[attr-defined]
+    try:
+        setattr(sk_datasets, "load_boston", _fake_load_boston)
+    except Exception as exc:
+        print(f"[WARN] 无法注入 load_boston 兼容符号，优化器将走兜底路径: {exc}")
 
 
 class FallbackRandomOptimizer:
@@ -497,7 +503,6 @@ def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
             q = hfss.post.available_report_quantities(
                 report_category="Far Fields",
                 context=context,
-                setup_sweep_name=setup,
             )
             if q:
                 ff_quantities = list(q)
