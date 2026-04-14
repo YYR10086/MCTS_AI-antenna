@@ -58,6 +58,7 @@ BAND_2 = (37.0, 39.0)
 TARGET_FREQS = (28.0, 38.0)
 S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
+GAIN_PHYSICAL_MAX = 30.0
 PARAM_SAFE_LB = {
     "dp": 0.3,
     "x1": 1.3,
@@ -690,6 +691,12 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
 
     gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0])
     gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1])
+    if gain_28 > GAIN_PHYSICAL_MAX or gain_28 < -60.0:
+        logging.warning("gain_28=%.2f 超出物理范围，置为 nan", gain_28)
+        gain_28 = float("nan")
+    if gain_38 > GAIN_PHYSICAL_MAX or gain_38 < -60.0:
+        logging.warning("gain_38=%.2f 超出物理范围，置为 nan", gain_38)
+        gain_38 = float("nan")
 
     return {
         "project_name": PROJECT_NAME,
@@ -801,6 +808,8 @@ def run_optimization(
         "y1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
     }
     optimizer = build_optimizer(api_config)
+    checkpoint_file = Path(output_dir) / "checkpoint.json"
+    observations_so_far: list[dict[str, Any]] = []
 
     iter_csv = Path(output_dir) / "optimization_log.csv"
     best_json = Path(output_dir) / "best_result.json"
@@ -809,6 +818,24 @@ def run_optimization(
     best_result: dict[str, Any] | None = None
     best_loss = float("inf")
     default_vars = DesignVariables()
+    start_iter = 1
+
+    if checkpoint_file.exists():
+        try:
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
+                ckpt = json.load(f)
+            start_iter = int(ckpt.get("next_iter", 1))
+            best_loss = float(ckpt.get("best_loss", float("inf")))
+            observations_so_far = list(ckpt.get("observations", []))
+            for obs in observations_so_far:
+                if isinstance(obs, dict) and "x" in obs and "loss" in obs:
+                    optimizer.observe([obs["x"]], [obs["loss"]])
+            print(f"[RESUME] 从第 {start_iter} 轮继续，已恢复 {len(observations_so_far)} 条观测")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] 检查点读取失败，忽略并从头开始: {exc}")
+            start_iter = 1
+            best_loss = float("inf")
+            observations_so_far = []
 
     project_file = Path(project_path).resolve()
     if not project_file.exists():
@@ -821,21 +848,23 @@ def run_optimization(
 
     max_valid_loss: float | None = None
     try:
-        with open(iter_csv, "w", newline="", encoding="utf-8-sig") as f:
+        csv_mode = "a" if start_iter > 1 and iter_csv.exists() else "w"
+        with open(iter_csv, csv_mode, newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "iter",
-                    "loss",
-                    "gain_28ghz_db",
-                    "gain_38ghz_db",
-                    "dualband_match_ok",
-                    "design_vars_json",
-                    "error",
-                ]
-            )
+            if csv_mode == "w":
+                writer.writerow(
+                    [
+                        "iter",
+                        "loss",
+                        "gain_28ghz_db",
+                        "gain_38ghz_db",
+                        "dualband_match_ok",
+                        "design_vars_json",
+                        "error",
+                    ]
+                )
 
-            index_iter = range(1, budget + 1)
+            index_iter = range(start_iter, budget + 1)
             if tqdm is not None:
                 index_iter = tqdm(
                     index_iter,
@@ -904,6 +933,15 @@ def run_optimization(
                     best_loss = loss
                     best_result = result
 
+                observations_so_far.append({"x": cand, "loss": loss})
+                ckpt_data = {
+                    "next_iter": i + 1,
+                    "best_loss": best_loss,
+                    "observations": observations_so_far,
+                }
+                with open(checkpoint_file, "w", encoding="utf-8") as f:
+                    json.dump(ckpt_data, f, ensure_ascii=False, indent=2)
+
                 try:
                     hfss.save_project()
                 except Exception:
@@ -937,6 +975,7 @@ def run_optimization(
 
     with open(best_json, "w", encoding="utf-8") as f:
         json.dump(final, f, ensure_ascii=False, indent=2)
+    checkpoint_file.unlink(missing_ok=True)
 
     return {
         "best_result_json": str(best_json),
