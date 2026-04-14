@@ -59,6 +59,7 @@ TARGET_FREQS = (28.0, 38.0)
 S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
 GAIN_PHYSICAL_MAX = 30.0
+RUN_SINGLE_SIM_FIRST = False
 PARAM_SAFE_LB = {
     "dp": 0.3,
     "x1": 1.3,
@@ -801,11 +802,11 @@ def run_optimization(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     api_config = {
-        "Rc": {"type": "real", "space": "linear", "range": (6.0, 7.5)},
-        "S": {"type": "real", "space": "linear", "range": (0.8, 1.8)},
-        "dp": {"type": "real", "space": "linear", "range": (0.3, 0.7)},
-        "x1": {"type": "real", "space": "linear", "range": (1.3, 2.5)},
-        "y1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
+        "Rc": {"type": "real", "space": "linear", "range": (6.0, 7.2)},
+        "S": {"type": "real", "space": "linear", "range": (0.8, 1.4)},
+        "dp": {"type": "real", "space": "linear", "range": (0.3, 0.65)},
+        "x1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
+        "y1": {"type": "real", "space": "linear", "range": (1.3, 2.0)},
     }
     optimizer = build_optimizer(api_config)
     checkpoint_file = Path(output_dir) / "checkpoint.json"
@@ -830,7 +831,7 @@ def run_optimization(
             for obs in observations_so_far:
                 if isinstance(obs, dict) and "x" in obs and "loss" in obs:
                     optimizer.observe([obs["x"]], [obs["loss"]])
-            print(f"[RESUME] 从第 {start_iter} 轮继续，已恢复 {len(observations_so_far)} 条观测")
+            print(f"[RESUME] 从第 {start_iter} 轮继续，历史观测 {len(observations_so_far)} 条")
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] 检查点读取失败，忽略并从头开始: {exc}")
             start_iter = 1
@@ -933,10 +934,10 @@ def run_optimization(
                     best_loss = loss
                     best_result = result
 
-                observations_so_far.append({"x": cand, "loss": loss})
+                observations_so_far.append({"x": cand, "loss": float(loss)})
                 ckpt_data = {
                     "next_iter": i + 1,
-                    "best_loss": best_loss,
+                    "best_loss": float(best_loss),
                     "observations": observations_so_far,
                 }
                 with open(checkpoint_file, "w", encoding="utf-8") as f:
@@ -988,35 +989,35 @@ def run_optimization(
 def main() -> None:
     try:
         _kill_stale_aedt()
-        # 1) 单次仿真（用默认参数）
-        one_shot = run_single_simulation(
-            project_path=PROJECT_PATH,
-            design_vars=DesignVariables(),
-            setup_name=SETUP_NAME,
-            sweep_name=SWEEP_NAME,
-        )
-
-        Path("outputs").mkdir(exist_ok=True)
-        with open("outputs/single_run_result.json", "w", encoding="utf-8") as f:
-            json.dump(one_shot, f, ensure_ascii=False, indent=2)
-        _export_s11_csv(one_shot, "outputs/single_run_s11.csv")
-
-        print("\n=== 单次仿真结果 ===")
-        print(
-            json.dumps(
-                {
-                    "gain_28ghz_db": one_shot["gain_28ghz_db"],
-                    "gain_38ghz_db": one_shot["gain_38ghz_db"],
-                    "dualband_match_ok": one_shot["dualband_match_ok"],
-                },
-                ensure_ascii=False,
-                indent=2,
+        if RUN_SINGLE_SIM_FIRST:
+            # 1) 单次仿真（用默认参数）
+            one_shot = run_single_simulation(
+                project_path=PROJECT_PATH,
+                design_vars=DesignVariables(),
+                setup_name=SETUP_NAME,
+                sweep_name=SWEEP_NAME,
             )
-        )
+            Path("outputs").mkdir(exist_ok=True)
+            with open("outputs/single_run_result.json", "w", encoding="utf-8") as f:
+                json.dump(one_shot, f, ensure_ascii=False, indent=2)
+            _export_s11_csv(one_shot, "outputs/single_run_s11.csv")
 
-        if STOP_REQUESTED:
-            print("[INTERRUPT] 用户中断后仅完成单次仿真，跳过优化。")
-            return
+            print("\n=== 单次仿真结果 ===")
+            print(
+                json.dumps(
+                    {
+                        "gain_28ghz_db": one_shot["gain_28ghz_db"],
+                        "gain_38ghz_db": one_shot["gain_38ghz_db"],
+                        "dualband_match_ok": one_shot["dualband_match_ok"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+
+            if STOP_REQUESTED:
+                print("[INTERRUPT] 用户中断后仅完成单次仿真，跳过优化。")
+                return
 
         # 2) 优化（调用改进算法）
         opt_result = run_optimization(project_path=PROJECT_PATH, budget=20, output_dir="outputs")
