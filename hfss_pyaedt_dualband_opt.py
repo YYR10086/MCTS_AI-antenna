@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import csv
+import glob
+import hashlib
 import json
 import logging
 import math
@@ -24,6 +26,7 @@ import signal
 import subprocess
 import threading
 import time
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -60,6 +63,22 @@ S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
 GAIN_PHYSICAL_MAX = 30.0
 RUN_SINGLE_SIM_FIRST = False
+# ============ 运行模式 ============
+RUN_MODE = "optimize"
+# 可选值：
+#   "single"    - 只跑单次仿真验证
+#   "optimize"  - 从头开始优化
+#   "reload"    - 从历史sim_results文件恢复后继续优化
+# ==================================
+
+API_CONFIG = {
+    "Rc": {"type": "real", "space": "linear", "range": (6.0, 7.2)},
+    "S": {"type": "real", "space": "linear", "range": (0.8, 1.4)},
+    "dp": {"type": "real", "space": "linear", "range": (0.3, 0.65)},
+    "x1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
+    "y1": {"type": "real", "space": "linear", "range": (1.3, 2.0)},
+}
+
 PARAM_SAFE_LB = {
     "dp": 0.3,
     "x1": 1.3,
@@ -549,7 +568,7 @@ def _check_geometry_valid(hfss: Hfss) -> bool:
         return False
 
 
-def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
+def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float) -> float:
     preferred_setup = f"{SETUP_NAME} : {SWEEP_NAME}"
     setup_candidates = [preferred_setup, f"{SETUP_NAME}:{SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
     context = FAR_FIELD_SPHERE
@@ -657,8 +676,46 @@ def _extract_gain_db(hfss: Hfss, target_freq_ghz: float) -> float:
             fail_reasons.append(f"antenna_data({getter_name}): {exc}")
 
     tail = " | ".join(fail_reasons[-8:]) if fail_reasons else "unknown"
-    print(f"[WARN] 提取 {target_freq_ghz} GHz 增益失败，返回 NaN。diagnostic={tail}")
+    print(f"[WARN] 提取 {target_freq_ghz} GHz 增益失败。diagnostic={tail}")
     return float("nan")
+
+
+def _extract_gain_db(hfss: Hfss, target_freq_ghz: float, max_retries: int = 2) -> float:
+    for attempt in range(max_retries):
+        try:
+            gain = _extract_gain_db_once(hfss, target_freq_ghz)
+            if np.isfinite(gain) and -60.0 < gain < GAIN_PHYSICAL_MAX:
+                return gain
+            logging.warning("第%d次提取gain=%.2f无效，等待重试...", attempt + 1, gain)
+            time.sleep(2)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("第%d次提取增益失败: %s", attempt + 1, exc)
+            time.sleep(2)
+    return float("nan")
+
+
+def _save_sim_result(output_dir: str, design_vars: dict[str, Any], result_dict: dict[str, Any]) -> None:
+    """将单次仿真结果保存为独立 JSON 文件。"""
+    sim_dir = Path(output_dir) / "sim_results"
+    sim_dir.mkdir(parents=True, exist_ok=True)
+
+    param_str = json.dumps(design_vars, sort_keys=True)
+    param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = sim_dir / f"sim_{timestamp}_{param_hash}.json"
+
+    payload = {
+        "timestamp": timestamp,
+        "params": design_vars,
+        "result": result_dict,
+    }
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    logging.info("仿真结果已保存: %s", filename)
+
+
+def _param_signature(params: dict[str, Any]) -> str:
+    return json.dumps(params, sort_keys=True, ensure_ascii=False)
 
 
 def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> dict[str, Any]:
@@ -797,20 +854,18 @@ def run_optimization(
     project_path: str,
     budget: int = 20,
     output_dir: str = "outputs",
+    optimizer: Any = None,
+    skip_already_seen: bool = False,
 ) -> dict[str, Any]:
     """调用 optimizer.py + turbo1.py 进行参数优化，并导出结果。"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    api_config = {
-        "Rc": {"type": "real", "space": "linear", "range": (6.0, 7.2)},
-        "S": {"type": "real", "space": "linear", "range": (0.8, 1.4)},
-        "dp": {"type": "real", "space": "linear", "range": (0.3, 0.65)},
-        "x1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
-        "y1": {"type": "real", "space": "linear", "range": (1.3, 2.0)},
-    }
-    optimizer = build_optimizer(api_config)
+    api_config = API_CONFIG
+    if optimizer is None:
+        optimizer = build_optimizer(api_config)
     checkpoint_file = Path(output_dir) / "checkpoint.json"
     observations_so_far: list[dict[str, Any]] = []
+    seen_losses: dict[str, float] = {}
 
     iter_csv = Path(output_dir) / "optimization_log.csv"
     best_json = Path(output_dir) / "best_result.json"
@@ -831,12 +886,29 @@ def run_optimization(
             for obs in observations_so_far:
                 if isinstance(obs, dict) and "x" in obs and "loss" in obs:
                     optimizer.observe([obs["x"]], [obs["loss"]])
+                    seen_losses[_param_signature(obs["x"])] = float(obs["loss"])
             print(f"[RESUME] 从第 {start_iter} 轮继续，历史观测 {len(observations_so_far)} 条")
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] 检查点读取失败，忽略并从头开始: {exc}")
             start_iter = 1
             best_loss = float("inf")
             observations_so_far = []
+
+    if skip_already_seen:
+        sim_dir = Path(output_dir) / "sim_results"
+        sim_files = sorted(glob.glob(str(sim_dir / "sim_*.json")))
+        for sim_file in sim_files:
+            try:
+                with open(sim_file, "r", encoding="utf-8") as fp:
+                    data = json.load(fp)
+                params = data.get("params", {})
+                loss = float(data.get("result", {}).get("loss"))
+                if isinstance(params, dict) and math.isfinite(loss):
+                    seen_losses[_param_signature(params)] = loss
+            except Exception:
+                continue
+        if seen_losses:
+            logging.info("已加载 %d 条历史仿真参数，用于去重。", len(seen_losses))
 
     project_file = Path(project_path).resolve()
     if not project_file.exists():
@@ -884,6 +956,13 @@ def run_optimization(
                     break
                 cand_raw = optimizer.suggest(1)[0]
                 cand = validate_params(cand_raw, api_config)
+                cand_sig = _param_signature(cand)
+                if skip_already_seen and cand_sig in seen_losses:
+                    old_loss = seen_losses[cand_sig]
+                    optimizer.observe([cand], [old_loss])
+                    logging.info("第 %d 轮建议命中历史参数，跳过HFSS仿真。loss=%.4f", i, old_loss)
+                    writer.writerow([i, old_loss, "", "", "", json.dumps(cand, ensure_ascii=False), "skip_already_seen"])
+                    continue
                 vars_i = DesignVariables(**{**asdict(default_vars), **cand})
 
                 err_msg = ""
@@ -914,6 +993,19 @@ def run_optimization(
                     loss = max_valid_loss if max_valid_loss is not None else 500.0
 
                 optimizer.observe([cand], [loss])
+                seen_losses[cand_sig] = float(loss)
+
+                if not err_msg:
+                    _save_sim_result(
+                        output_dir,
+                        asdict(vars_i),
+                        {
+                            "gain_28ghz_db": result.get("gain_28ghz_db"),
+                            "gain_38ghz_db": result.get("gain_38ghz_db"),
+                            "loss": loss,
+                            "dualband_match_ok": bool(result.get("dualband_match_ok", False)),
+                        },
+                    )
 
                 writer.writerow(
                     [
@@ -986,11 +1078,48 @@ def run_optimization(
     }
 
 
+def load_and_reoptimize(sim_results_dir: str, budget: int = 50, output_dir: str = "outputs") -> dict[str, Any]:
+    """读取历史仿真结果，回放观测后继续优化。"""
+    sim_dir = Path(sim_results_dir)
+    files = sorted(glob.glob(str(sim_dir / "sim_*.json")))
+    print(f"[RELOAD] 找到 {len(files)} 条历史仿真记录")
+
+    history: list[tuple[dict[str, float], float]] = []
+    for one_file in files:
+        try:
+            with open(one_file, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            params = data.get("params", {})
+            loss = data.get("result", {}).get("loss")
+            if not isinstance(params, dict):
+                continue
+            loss_f = float(loss)
+            if not np.isfinite(loss_f):
+                continue
+            history.append((params, loss_f))
+        except Exception:
+            continue
+
+    print(f"[RELOAD] 其中有效记录 {len(history)} 条")
+
+    optimizer = build_optimizer(API_CONFIG)
+    for params, loss in history:
+        optimizer.observe([params], [loss])
+
+    print("[RELOAD] 历史数据已注入优化器，开始新一轮优化...")
+    return run_optimization(
+        project_path=PROJECT_PATH,
+        budget=budget,
+        output_dir=output_dir,
+        optimizer=optimizer,
+        skip_already_seen=True,
+    )
+
+
 def main() -> None:
     try:
         _kill_stale_aedt()
-        if RUN_SINGLE_SIM_FIRST:
-            # 1) 单次仿真（用默认参数）
+        if RUN_MODE == "single":
             one_shot = run_single_simulation(
                 project_path=PROJECT_PATH,
                 design_vars=DesignVariables(),
@@ -1015,12 +1144,16 @@ def main() -> None:
                 )
             )
 
-            if STOP_REQUESTED:
-                print("[INTERRUPT] 用户中断后仅完成单次仿真，跳过优化。")
-                return
-
-        # 2) 优化（调用改进算法）
-        opt_result = run_optimization(project_path=PROJECT_PATH, budget=20, output_dir="outputs")
+        elif RUN_MODE == "optimize":
+            opt_result = run_optimization(project_path=PROJECT_PATH, budget=20, output_dir="outputs")
+        elif RUN_MODE == "reload":
+            opt_result = load_and_reoptimize(
+                sim_results_dir="outputs/sim_results",
+                budget=30,
+                output_dir="outputs",
+            )
+        else:
+            raise ValueError(f"未知 RUN_MODE={RUN_MODE!r}，可选: single/optimize/reload")
 
         print("\n=== 优化结果文件 ===")
         print(json.dumps(opt_result, ensure_ascii=False, indent=2))
