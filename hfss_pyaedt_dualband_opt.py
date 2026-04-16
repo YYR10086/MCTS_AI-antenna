@@ -63,12 +63,13 @@ S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
 GAIN_PHYSICAL_MAX = 30.0
 RUN_SINGLE_SIM_FIRST = False
+DEDUP_THRESHOLD = 1e-4  # 仅将“数值误差级别”的参数差异视为重复
 # ============ 运行模式 ============
 RUN_MODE = "optimize"
 # 可选值：
 #   "single"    - 只跑单次仿真验证
 #   "optimize"  - 从头开始优化
-#   "reload"    - 从历史sim_results文件恢复后继续优化
+#   "reload"    - 注入历史sim_results后重新从第1轮跑“新增预算”
 # ==================================
 
 API_CONFIG = {
@@ -718,6 +719,27 @@ def _param_signature(params: dict[str, Any]) -> str:
     return json.dumps(params, sort_keys=True, ensure_ascii=False)
 
 
+def _is_almost_same_params(
+    params_a: dict[str, Any],
+    params_b: dict[str, Any],
+    tol: float = DEDUP_THRESHOLD,
+) -> bool:
+    """去重判定：仅当参数几乎完全一致（误差不超过 tol）才认为重复。"""
+    if params_a.keys() != params_b.keys():
+        return False
+    for key in params_a:
+        try:
+            va = float(params_a[key])
+            vb = float(params_b[key])
+        except (TypeError, ValueError):
+            if params_a[key] != params_b[key]:
+                return False
+            continue
+        if abs(va - vb) > tol:
+            return False
+    return True
+
+
 def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> dict[str, Any]:
     """在已打开的 HFSS 会话中评估一次设计。"""
     _apply_design_variables(hfss, design_vars)
@@ -856,6 +878,7 @@ def run_optimization(
     output_dir: str = "outputs",
     optimizer: Any = None,
     skip_already_seen: bool = False,
+    resume_from_checkpoint: bool = True,
 ) -> dict[str, Any]:
     """调用 optimizer.py + turbo1.py 进行参数优化，并导出结果。"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -866,6 +889,7 @@ def run_optimization(
     checkpoint_file = Path(output_dir) / "checkpoint.json"
     observations_so_far: list[dict[str, Any]] = []
     seen_losses: dict[str, float] = {}
+    seen_param_points: list[tuple[dict[str, Any], float]] = []
 
     iter_csv = Path(output_dir) / "optimization_log.csv"
     best_json = Path(output_dir) / "best_result.json"
@@ -876,7 +900,7 @@ def run_optimization(
     default_vars = DesignVariables()
     start_iter = 1
 
-    if checkpoint_file.exists():
+    if resume_from_checkpoint and checkpoint_file.exists():
         try:
             with open(checkpoint_file, "r", encoding="utf-8") as f:
                 ckpt = json.load(f)
@@ -886,7 +910,9 @@ def run_optimization(
             for obs in observations_so_far:
                 if isinstance(obs, dict) and "x" in obs and "loss" in obs:
                     optimizer.observe([obs["x"]], [obs["loss"]])
-                    seen_losses[_param_signature(obs["x"])] = float(obs["loss"])
+                    loss_obs = float(obs["loss"])
+                    seen_losses[_param_signature(obs["x"])] = loss_obs
+                    seen_param_points.append((obs["x"], loss_obs))
             print(f"[RESUME] 从第 {start_iter} 轮继续，历史观测 {len(observations_so_far)} 条")
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] 检查点读取失败，忽略并从头开始: {exc}")
@@ -905,10 +931,15 @@ def run_optimization(
                 loss = float(data.get("result", {}).get("loss"))
                 if isinstance(params, dict) and math.isfinite(loss):
                     seen_losses[_param_signature(params)] = loss
+                    seen_param_points.append((params, loss))
             except Exception:
                 continue
         if seen_losses:
-            logging.info("已加载 %d 条历史仿真参数，用于去重。", len(seen_losses))
+            logging.info(
+                "已加载 %d 条历史仿真参数用于去重（DEDUP_THRESHOLD=%.1e）。",
+                len(seen_param_points),
+                DEDUP_THRESHOLD,
+            )
 
     project_file = Path(project_path).resolve()
     if not project_file.exists():
@@ -957,10 +988,21 @@ def run_optimization(
                 cand_raw = optimizer.suggest(1)[0]
                 cand = validate_params(cand_raw, api_config)
                 cand_sig = _param_signature(cand)
-                if skip_already_seen and cand_sig in seen_losses:
-                    old_loss = seen_losses[cand_sig]
+                dup_hist = None
+                if skip_already_seen:
+                    for hist_params, hist_loss in seen_param_points:
+                        if _is_almost_same_params(cand, hist_params, tol=DEDUP_THRESHOLD):
+                            dup_hist = (hist_params, hist_loss)
+                            break
+                if dup_hist is not None:
+                    old_loss = dup_hist[1]
                     optimizer.observe([cand], [old_loss])
-                    logging.info("第 %d 轮建议命中历史参数，跳过HFSS仿真。loss=%.4f", i, old_loss)
+                    logging.info(
+                        "第 %d 轮建议命中历史参数(容差%.1e)，跳过HFSS仿真。loss=%.4f",
+                        i,
+                        DEDUP_THRESHOLD,
+                        old_loss,
+                    )
                     writer.writerow([i, old_loss, "", "", "", json.dumps(cand, ensure_ascii=False), "skip_already_seen"])
                     continue
                 vars_i = DesignVariables(**{**asdict(default_vars), **cand})
@@ -994,6 +1036,7 @@ def run_optimization(
 
                 optimizer.observe([cand], [loss])
                 seen_losses[cand_sig] = float(loss)
+                seen_param_points.append((cand, float(loss)))
 
                 if not err_msg:
                     _save_sim_result(
@@ -1079,7 +1122,10 @@ def run_optimization(
 
 
 def load_and_reoptimize(sim_results_dir: str, budget: int = 50, output_dir: str = "outputs") -> dict[str, Any]:
-    """读取历史仿真结果，回放观测后继续优化。"""
+    """读取历史仿真结果，回放观测后做 reload 优化。
+
+    注意：budget 表示“在历史基础上的新增仿真轮数”，不是累计总轮数。
+    """
     sim_dir = Path(sim_results_dir)
     files = sorted(glob.glob(str(sim_dir / "sim_*.json")))
     print(f"[RELOAD] 找到 {len(files)} 条历史仿真记录")
@@ -1112,7 +1158,8 @@ def load_and_reoptimize(sim_results_dir: str, budget: int = 50, output_dir: str 
         budget=budget,
         output_dir=output_dir,
         optimizer=optimizer,
-        skip_already_seen=True,
+        skip_already_seen=False,
+        resume_from_checkpoint=False,
     )
 
 
@@ -1149,7 +1196,7 @@ def main() -> None:
         elif RUN_MODE == "reload":
             opt_result = load_and_reoptimize(
                 sim_results_dir="outputs/sim_results",
-                budget=30,
+                budget=30,  # reload 模式下表示新增 30 轮仿真，而非总轮数
                 output_dir="outputs",
             )
         else:
