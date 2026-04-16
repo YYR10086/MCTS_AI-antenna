@@ -31,6 +31,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import numpy as np
 try:
     from ansys.aedt.core import Hfss
@@ -64,6 +66,7 @@ STOP_REQUESTED = False
 GAIN_PHYSICAL_MAX = 30.0
 RUN_SINGLE_SIM_FIRST = False
 DEDUP_THRESHOLD = 1e-4  # 仅将“数值误差级别”的参数差异视为重复
+SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
 # ============ 运行模式 ============
 RUN_MODE = "optimize"
 # 可选值：
@@ -346,11 +349,43 @@ def _apply_design_variables(hfss: Hfss, design_vars: dict[str, float]) -> None:
         if existing_vars is not None and name not in existing_vars:
             logging.warning("变量 '%s' 在HFSS设计中不存在，跳过写入", name)
             continue
+        expr = f"{float(value):.6f}mm"
+        success = False
+
+        # 方式1：高层变量管理接口
         try:
-            hfss[name] = f"{float(value):.6f}mm"
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("写入变量 '%s'=%s 失败: %s，跳过", name, value, exc)
-            continue
+            hfss.variable_manager[name] = expr
+            success = True
+        except Exception:
+            pass
+
+        # 方式2：对象索引接口
+        if not success:
+            try:
+                hfss[name] = expr
+                success = True
+            except Exception:
+                pass
+
+        # 方式3：最底层 ChangeProperty 接口
+        if not success:
+            try:
+                hfss.odesign.ChangeProperty(
+                    [
+                        "NAME:AllTabs",
+                        [
+                            "NAME:LocalVariableTab",
+                            ["NAME:PropServers", "LocalVariables"],
+                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                        ],
+                    ]
+                )
+                success = True
+            except Exception as exc:  # noqa: BLE001
+                logging.error("变量 '%s' 三种方式均写入失败: %s", name, exc)
+
+        if success:
+            logging.debug("变量 '%s' = %s 写入成功", name, expr)
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
@@ -754,7 +789,7 @@ def _is_almost_same_params(
     return True
 
 
-def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> dict[str, Any]:
+def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> tuple[dict[str, Any], Hfss]:
     """在已打开的 HFSS 会话中评估一次设计。"""
     # 只写入优化参数，不覆盖 HFSS 工程内的固定参数
     design_vars_all = asdict(design_vars)
@@ -762,23 +797,37 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
     try:
         _apply_design_variables(hfss, design_vars_opt)
     except Exception as exc:  # noqa: BLE001
-        logging.error("写入设计变量失败: %s，本轮标记为失败", exc)
-        return {
-            "project_name": PROJECT_NAME,
-            "design_name": DESIGN_NAME,
-            "setup_name": SETUP_NAME,
-            "sweep_name": SWEEP_NAME,
-            "far_field_sphere": FAR_FIELD_SPHERE,
-            "project_path": project_path,
-            "design_vars": design_vars_all,
-            "s11_curve": {"freq_ghz": [], "s11_db": []},
-            "gain_28ghz_db": float("nan"),
-            "gain_38ghz_db": float("nan"),
-            "loss": 500.0,
-            "dualband_match_ok": False,
-            "band_26_32_ok": False,
-            "band_37_39_ok": False,
-        }
+        logging.warning("写入设计变量首次失败: %s，尝试刷新HFSS会话后重试一次", exc)
+        try:
+            hfss.save_project()
+        except Exception:
+            pass
+        try:
+            hfss.release_desktop()
+        except Exception:
+            pass
+        time.sleep(3)
+        hfss = _create_hfss_session(Path(project_path), non_graphical=True, version="2025.1")
+        try:
+            _apply_design_variables(hfss, design_vars_opt)
+        except Exception as exc2:  # noqa: BLE001
+            logging.error("写入设计变量重试仍失败: %s，本轮标记为失败", exc2)
+            return {
+                "project_name": PROJECT_NAME,
+                "design_name": DESIGN_NAME,
+                "setup_name": SETUP_NAME,
+                "sweep_name": SWEEP_NAME,
+                "far_field_sphere": FAR_FIELD_SPHERE,
+                "project_path": project_path,
+                "design_vars": design_vars_all,
+                "s11_curve": {"freq_ghz": [], "s11_db": []},
+                "gain_28ghz_db": float("nan"),
+                "gain_38ghz_db": float("nan"),
+                "loss": 500.0,
+                "dualband_match_ok": False,
+                "band_26_32_ok": False,
+                "band_37_39_ok": False,
+            }, hfss
     try:
         hfss.save_project()
     except Exception:
@@ -831,7 +880,7 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
         "band_26_32_ok": band1_ok,
         "band_37_39_ok": band2_ok,
         "dualband_match_ok": bool(band1_ok and band2_ok),
-    }
+    }, hfss
 
 
 def run_single_simulation(
@@ -855,7 +904,8 @@ def run_single_simulation(
     hfss = None
     try:
         hfss = _create_hfss_session(project_file, non_graphical=non_graphical, version=version)
-        return _evaluate_with_open_hfss(hfss, design_vars, str(project_file))
+        result, hfss = _evaluate_with_open_hfss(hfss, design_vars, str(project_file))
+        return result
     except Exception as exc:  # noqa: BLE001
         if isinstance(exc, KeyboardInterrupt):
             raise
@@ -1021,6 +1071,18 @@ def run_optimization(
                 if STOP_REQUESTED:
                     print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
                     break
+
+                if i > 1 and (i - start_iter) % SESSION_REFRESH_INTERVAL == 0:
+                    logging.info("第 %d 轮，主动刷新HFSS会话...", i)
+                    try:
+                        hfss.save_project()
+                        hfss.release_desktop()
+                    except Exception:
+                        pass
+                    time.sleep(3)
+                    hfss = _create_hfss_session(project_file, non_graphical=True, version="2025.1")
+                    logging.info("HFSS会话已刷新，新PID已建立")
+
                 cand_raw = optimizer.suggest(1)[0]
                 cand = validate_params(cand_raw, api_config)
                 cand_sig = _param_signature(cand)
@@ -1045,7 +1107,7 @@ def run_optimization(
 
                 err_msg = ""
                 try:
-                    result = _evaluate_with_open_hfss(hfss, vars_i, str(project_file))
+                    result, hfss = _evaluate_with_open_hfss(hfss, vars_i, str(project_file))
                     if "loss" in result and math.isfinite(float(result["loss"])):
                         loss = float(result["loss"])
                     else:
