@@ -79,6 +79,7 @@ API_CONFIG = {
     "x1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
     "y1": {"type": "real", "space": "linear", "range": (1.3, 2.0)},
 }
+OPT_PARAM_NAMES = ["Rc", "S", "dp", "x1", "y1"]  # 仅优化这 5 个参数
 
 PARAM_SAFE_LB = {
     "dp": 0.3,
@@ -334,9 +335,22 @@ def validate_params(params: dict[str, float], api_config: dict[str, dict[str, An
     return fixed
 
 
-def _apply_design_variables(hfss: Hfss, variables: DesignVariables) -> None:
-    for name, value in asdict(variables).items():
-        hfss[name] = f"{value:.6f}mm"
+def _apply_design_variables(hfss: Hfss, design_vars: dict[str, float]) -> None:
+    """将优化参数写入 HFSS；不存在或写入失败的变量将被跳过。"""
+    try:
+        existing_vars = set(hfss.variable_manager.variable_names)
+    except Exception:
+        existing_vars = None  # 获取失败则不过滤，尝试全部写入
+
+    for name, value in design_vars.items():
+        if existing_vars is not None and name not in existing_vars:
+            logging.warning("变量 '%s' 在HFSS设计中不存在，跳过写入", name)
+            continue
+        try:
+            hfss[name] = f"{float(value):.6f}mm"
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("写入变量 '%s'=%s 失败: %s，跳过", name, value, exc)
+            continue
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
@@ -742,7 +756,29 @@ def _is_almost_same_params(
 
 def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> dict[str, Any]:
     """在已打开的 HFSS 会话中评估一次设计。"""
-    _apply_design_variables(hfss, design_vars)
+    # 只写入优化参数，不覆盖 HFSS 工程内的固定参数
+    design_vars_all = asdict(design_vars)
+    design_vars_opt = {k: float(v) for k, v in design_vars_all.items() if k in OPT_PARAM_NAMES}
+    try:
+        _apply_design_variables(hfss, design_vars_opt)
+    except Exception as exc:  # noqa: BLE001
+        logging.error("写入设计变量失败: %s，本轮标记为失败", exc)
+        return {
+            "project_name": PROJECT_NAME,
+            "design_name": DESIGN_NAME,
+            "setup_name": SETUP_NAME,
+            "sweep_name": SWEEP_NAME,
+            "far_field_sphere": FAR_FIELD_SPHERE,
+            "project_path": project_path,
+            "design_vars": design_vars_all,
+            "s11_curve": {"freq_ghz": [], "s11_db": []},
+            "gain_28ghz_db": float("nan"),
+            "gain_38ghz_db": float("nan"),
+            "loss": 500.0,
+            "dualband_match_ok": False,
+            "band_26_32_ok": False,
+            "band_37_39_ok": False,
+        }
     try:
         hfss.save_project()
     except Exception:
@@ -1010,7 +1046,10 @@ def run_optimization(
                 err_msg = ""
                 try:
                     result = _evaluate_with_open_hfss(hfss, vars_i, str(project_file))
-                    loss = _objective(result)
+                    if "loss" in result and math.isfinite(float(result["loss"])):
+                        loss = float(result["loss"])
+                    else:
+                        loss = _objective(result)
                 except KeyboardInterrupt:
                     print("[INTERRUPT] 单次仿真被用户中断，结束优化并保留已有结果。")
                     break
