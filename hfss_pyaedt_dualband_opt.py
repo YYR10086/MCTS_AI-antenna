@@ -31,6 +31,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import numpy as np
 try:
     from ansys.aedt.core import Hfss
@@ -63,12 +65,14 @@ S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
 GAIN_PHYSICAL_MAX = 30.0
 RUN_SINGLE_SIM_FIRST = False
+DEDUP_THRESHOLD = 1e-4  # 仅将“数值误差级别”的参数差异视为重复
+SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
 # ============ 运行模式 ============
 RUN_MODE = "optimize"
 # 可选值：
 #   "single"    - 只跑单次仿真验证
 #   "optimize"  - 从头开始优化
-#   "reload"    - 从历史sim_results文件恢复后继续优化
+#   "reload"    - 注入历史sim_results后重新从第1轮跑“新增预算”
 # ==================================
 
 API_CONFIG = {
@@ -78,6 +82,7 @@ API_CONFIG = {
     "x1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
     "y1": {"type": "real", "space": "linear", "range": (1.3, 2.0)},
 }
+OPT_PARAM_NAMES = ["Rc", "S", "dp", "x1", "y1"]  # 仅优化这 5 个参数
 
 PARAM_SAFE_LB = {
     "dp": 0.3,
@@ -333,9 +338,54 @@ def validate_params(params: dict[str, float], api_config: dict[str, dict[str, An
     return fixed
 
 
-def _apply_design_variables(hfss: Hfss, variables: DesignVariables) -> None:
-    for name, value in asdict(variables).items():
-        hfss[name] = f"{value:.6f}mm"
+def _apply_design_variables(hfss: Hfss, design_vars: dict[str, float]) -> None:
+    """将优化参数写入 HFSS；不存在或写入失败的变量将被跳过。"""
+    try:
+        existing_vars = set(hfss.variable_manager.variable_names)
+    except Exception:
+        existing_vars = None  # 获取失败则不过滤，尝试全部写入
+
+    for name, value in design_vars.items():
+        if existing_vars is not None and name not in existing_vars:
+            logging.warning("变量 '%s' 在HFSS设计中不存在，跳过写入", name)
+            continue
+        expr = f"{float(value):.6f}mm"
+        success = False
+
+        # 方式1：高层变量管理接口
+        try:
+            hfss.variable_manager[name] = expr
+            success = True
+        except Exception:
+            pass
+
+        # 方式2：对象索引接口
+        if not success:
+            try:
+                hfss[name] = expr
+                success = True
+            except Exception:
+                pass
+
+        # 方式3：最底层 ChangeProperty 接口
+        if not success:
+            try:
+                hfss.odesign.ChangeProperty(
+                    [
+                        "NAME:AllTabs",
+                        [
+                            "NAME:LocalVariableTab",
+                            ["NAME:PropServers", "LocalVariables"],
+                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                        ],
+                    ]
+                )
+                success = True
+            except Exception as exc:  # noqa: BLE001
+                logging.error("变量 '%s' 三种方式均写入失败: %s", name, exc)
+
+        if success:
+            logging.debug("变量 '%s' = %s 写入成功", name, expr)
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
@@ -718,9 +768,66 @@ def _param_signature(params: dict[str, Any]) -> str:
     return json.dumps(params, sort_keys=True, ensure_ascii=False)
 
 
-def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> dict[str, Any]:
+def _is_almost_same_params(
+    params_a: dict[str, Any],
+    params_b: dict[str, Any],
+    tol: float = DEDUP_THRESHOLD,
+) -> bool:
+    """去重判定：仅当参数几乎完全一致（误差不超过 tol）才认为重复。"""
+    if params_a.keys() != params_b.keys():
+        return False
+    for key in params_a:
+        try:
+            va = float(params_a[key])
+            vb = float(params_b[key])
+        except (TypeError, ValueError):
+            if params_a[key] != params_b[key]:
+                return False
+            continue
+        if abs(va - vb) > tol:
+            return False
+    return True
+
+
+def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> tuple[dict[str, Any], Hfss]:
     """在已打开的 HFSS 会话中评估一次设计。"""
-    _apply_design_variables(hfss, design_vars)
+    # 只写入优化参数，不覆盖 HFSS 工程内的固定参数
+    design_vars_all = asdict(design_vars)
+    design_vars_opt = {k: float(v) for k, v in design_vars_all.items() if k in OPT_PARAM_NAMES}
+    try:
+        _apply_design_variables(hfss, design_vars_opt)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("写入设计变量首次失败: %s，尝试刷新HFSS会话后重试一次", exc)
+        try:
+            hfss.save_project()
+        except Exception:
+            pass
+        try:
+            hfss.release_desktop()
+        except Exception:
+            pass
+        time.sleep(3)
+        hfss = _create_hfss_session(Path(project_path), non_graphical=True, version="2025.1")
+        try:
+            _apply_design_variables(hfss, design_vars_opt)
+        except Exception as exc2:  # noqa: BLE001
+            logging.error("写入设计变量重试仍失败: %s，本轮标记为失败", exc2)
+            return {
+                "project_name": PROJECT_NAME,
+                "design_name": DESIGN_NAME,
+                "setup_name": SETUP_NAME,
+                "sweep_name": SWEEP_NAME,
+                "far_field_sphere": FAR_FIELD_SPHERE,
+                "project_path": project_path,
+                "design_vars": design_vars_all,
+                "s11_curve": {"freq_ghz": [], "s11_db": []},
+                "gain_28ghz_db": float("nan"),
+                "gain_38ghz_db": float("nan"),
+                "loss": 500.0,
+                "dualband_match_ok": False,
+                "band_26_32_ok": False,
+                "band_37_39_ok": False,
+            }, hfss
     try:
         hfss.save_project()
     except Exception:
@@ -773,7 +880,7 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
         "band_26_32_ok": band1_ok,
         "band_37_39_ok": band2_ok,
         "dualband_match_ok": bool(band1_ok and band2_ok),
-    }
+    }, hfss
 
 
 def run_single_simulation(
@@ -797,7 +904,8 @@ def run_single_simulation(
     hfss = None
     try:
         hfss = _create_hfss_session(project_file, non_graphical=non_graphical, version=version)
-        return _evaluate_with_open_hfss(hfss, design_vars, str(project_file))
+        result, hfss = _evaluate_with_open_hfss(hfss, design_vars, str(project_file))
+        return result
     except Exception as exc:  # noqa: BLE001
         if isinstance(exc, KeyboardInterrupt):
             raise
@@ -856,6 +964,7 @@ def run_optimization(
     output_dir: str = "outputs",
     optimizer: Any = None,
     skip_already_seen: bool = False,
+    resume_from_checkpoint: bool = True,
 ) -> dict[str, Any]:
     """调用 optimizer.py + turbo1.py 进行参数优化，并导出结果。"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -866,6 +975,7 @@ def run_optimization(
     checkpoint_file = Path(output_dir) / "checkpoint.json"
     observations_so_far: list[dict[str, Any]] = []
     seen_losses: dict[str, float] = {}
+    seen_param_points: list[tuple[dict[str, Any], float]] = []
 
     iter_csv = Path(output_dir) / "optimization_log.csv"
     best_json = Path(output_dir) / "best_result.json"
@@ -876,7 +986,7 @@ def run_optimization(
     default_vars = DesignVariables()
     start_iter = 1
 
-    if checkpoint_file.exists():
+    if resume_from_checkpoint and checkpoint_file.exists():
         try:
             with open(checkpoint_file, "r", encoding="utf-8") as f:
                 ckpt = json.load(f)
@@ -886,7 +996,9 @@ def run_optimization(
             for obs in observations_so_far:
                 if isinstance(obs, dict) and "x" in obs and "loss" in obs:
                     optimizer.observe([obs["x"]], [obs["loss"]])
-                    seen_losses[_param_signature(obs["x"])] = float(obs["loss"])
+                    loss_obs = float(obs["loss"])
+                    seen_losses[_param_signature(obs["x"])] = loss_obs
+                    seen_param_points.append((obs["x"], loss_obs))
             print(f"[RESUME] 从第 {start_iter} 轮继续，历史观测 {len(observations_so_far)} 条")
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] 检查点读取失败，忽略并从头开始: {exc}")
@@ -905,10 +1017,15 @@ def run_optimization(
                 loss = float(data.get("result", {}).get("loss"))
                 if isinstance(params, dict) and math.isfinite(loss):
                     seen_losses[_param_signature(params)] = loss
+                    seen_param_points.append((params, loss))
             except Exception:
                 continue
         if seen_losses:
-            logging.info("已加载 %d 条历史仿真参数，用于去重。", len(seen_losses))
+            logging.info(
+                "已加载 %d 条历史仿真参数用于去重（DEDUP_THRESHOLD=%.1e）。",
+                len(seen_param_points),
+                DEDUP_THRESHOLD,
+            )
 
     project_file = Path(project_path).resolve()
     if not project_file.exists():
@@ -954,21 +1071,47 @@ def run_optimization(
                 if STOP_REQUESTED:
                     print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
                     break
+
+                if i > 1 and (i - start_iter) % SESSION_REFRESH_INTERVAL == 0:
+                    logging.info("第 %d 轮，主动刷新HFSS会话...", i)
+                    try:
+                        hfss.save_project()
+                        hfss.release_desktop()
+                    except Exception:
+                        pass
+                    time.sleep(3)
+                    hfss = _create_hfss_session(project_file, non_graphical=True, version="2025.1")
+                    logging.info("HFSS会话已刷新，新PID已建立")
+
                 cand_raw = optimizer.suggest(1)[0]
                 cand = validate_params(cand_raw, api_config)
                 cand_sig = _param_signature(cand)
-                if skip_already_seen and cand_sig in seen_losses:
-                    old_loss = seen_losses[cand_sig]
+                dup_hist = None
+                if skip_already_seen:
+                    for hist_params, hist_loss in seen_param_points:
+                        if _is_almost_same_params(cand, hist_params, tol=DEDUP_THRESHOLD):
+                            dup_hist = (hist_params, hist_loss)
+                            break
+                if dup_hist is not None:
+                    old_loss = dup_hist[1]
                     optimizer.observe([cand], [old_loss])
-                    logging.info("第 %d 轮建议命中历史参数，跳过HFSS仿真。loss=%.4f", i, old_loss)
+                    logging.info(
+                        "第 %d 轮建议命中历史参数(容差%.1e)，跳过HFSS仿真。loss=%.4f",
+                        i,
+                        DEDUP_THRESHOLD,
+                        old_loss,
+                    )
                     writer.writerow([i, old_loss, "", "", "", json.dumps(cand, ensure_ascii=False), "skip_already_seen"])
                     continue
                 vars_i = DesignVariables(**{**asdict(default_vars), **cand})
 
                 err_msg = ""
                 try:
-                    result = _evaluate_with_open_hfss(hfss, vars_i, str(project_file))
-                    loss = _objective(result)
+                    result, hfss = _evaluate_with_open_hfss(hfss, vars_i, str(project_file))
+                    if "loss" in result and math.isfinite(float(result["loss"])):
+                        loss = float(result["loss"])
+                    else:
+                        loss = _objective(result)
                 except KeyboardInterrupt:
                     print("[INTERRUPT] 单次仿真被用户中断，结束优化并保留已有结果。")
                     break
@@ -994,6 +1137,7 @@ def run_optimization(
 
                 optimizer.observe([cand], [loss])
                 seen_losses[cand_sig] = float(loss)
+                seen_param_points.append((cand, float(loss)))
 
                 if not err_msg:
                     _save_sim_result(
@@ -1079,7 +1223,10 @@ def run_optimization(
 
 
 def load_and_reoptimize(sim_results_dir: str, budget: int = 50, output_dir: str = "outputs") -> dict[str, Any]:
-    """读取历史仿真结果，回放观测后继续优化。"""
+    """读取历史仿真结果，回放观测后做 reload 优化。
+
+    注意：budget 表示“在历史基础上的新增仿真轮数”，不是累计总轮数。
+    """
     sim_dir = Path(sim_results_dir)
     files = sorted(glob.glob(str(sim_dir / "sim_*.json")))
     print(f"[RELOAD] 找到 {len(files)} 条历史仿真记录")
@@ -1112,7 +1259,8 @@ def load_and_reoptimize(sim_results_dir: str, budget: int = 50, output_dir: str 
         budget=budget,
         output_dir=output_dir,
         optimizer=optimizer,
-        skip_already_seen=True,
+        skip_already_seen=False,
+        resume_from_checkpoint=False,
     )
 
 
@@ -1149,7 +1297,7 @@ def main() -> None:
         elif RUN_MODE == "reload":
             opt_result = load_and_reoptimize(
                 sim_results_dir="outputs/sim_results",
-                budget=30,
+                budget=30,  # reload 模式下表示新增 30 轮仿真，而非总轮数
                 output_dir="outputs",
             )
         else:
