@@ -39,12 +39,6 @@ try:
 except Exception:  # noqa: BLE001
     from pyaedt import Hfss
 
-try:
-    from tqdm import tqdm
-except Exception:  # noqa: BLE001
-    tqdm = None
-
-
 # -----------------------------
 # 工程参数（可直接改成你本机绝对路径）
 # -----------------------------
@@ -64,16 +58,9 @@ TARGET_FREQS = (28.0, 38.0)
 S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
 GAIN_PHYSICAL_MAX = 30.0
-RUN_SINGLE_SIM_FIRST = False
 DEDUP_THRESHOLD = 1e-4  # 仅将“数值误差级别”的参数差异视为重复
 SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
-# ============ 运行模式 ============
-RUN_MODE = "optimize"
-# 可选值：
-#   "single"    - 只跑单次仿真验证
-#   "optimize"  - 从头开始优化
-#   "reload"    - 注入历史sim_results后重新从第1轮跑“新增预算”
-# ==================================
+BUDGET = 100  # 服务器上一次跑100轮
 
 API_CONFIG = {
     "Rc": {"type": "real", "space": "linear", "range": (6.0, 7.2)},
@@ -109,7 +96,7 @@ def _kill_stale_aedt() -> None:
     """强制结束所有残留的 AEDT 进程（仅 Windows）。"""
     if platform.system() != "Windows":
         return
-    targets = ["ansysedt.exe", "ansysedtsv.exe"]
+    targets = ["ansysedt.exe", "ansysedtsv.exe", "ANSYSEDT.exe"]
     for name in targets:
         try:
             subprocess.run(
@@ -178,7 +165,7 @@ def _run_analyze_with_interrupt(hfss: Hfss, setup_name: str) -> None:
     def _target():
         try:
             try:
-                hfss.analyze_setup(setup_name, use_auto_settings=False, num_cores=4)
+                hfss.analyze_setup(setup_name)
             except TypeError:
                 hfss.odesign.Analyze(setup_name)
         except Exception as exc:  # noqa: BLE001
@@ -339,12 +326,13 @@ def validate_params(params: dict[str, float], api_config: dict[str, dict[str, An
 
 
 def _apply_design_variables(hfss: Hfss, design_vars: dict[str, float]) -> None:
-    """将优化参数写入 HFSS；不存在或写入失败的变量将被跳过。"""
+    """将优化参数写入 HFSS；若存在变量写入失败则抛出异常。"""
     try:
         existing_vars = set(hfss.variable_manager.variable_names)
     except Exception:
         existing_vars = None  # 获取失败则不过滤，尝试全部写入
 
+    failed_vars: list[str] = []
     for name, value in design_vars.items():
         if existing_vars is not None and name not in existing_vars:
             logging.warning("变量 '%s' 在HFSS设计中不存在，跳过写入", name)
@@ -383,9 +371,13 @@ def _apply_design_variables(hfss: Hfss, design_vars: dict[str, float]) -> None:
                 success = True
             except Exception as exc:  # noqa: BLE001
                 logging.error("变量 '%s' 三种方式均写入失败: %s", name, exc)
+                failed_vars.append(name)
 
         if success:
             logging.debug("变量 '%s' = %s 写入成功", name, expr)
+
+    if failed_vars:
+        raise RuntimeError(f"设计变量写入失败: {', '.join(failed_vars)}")
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
@@ -476,59 +468,24 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
         except Exception as exc:  # noqa: BLE001
             print(f"[LOCK] 删除锁文件失败: {exc}")
 
-    try:
-        return Hfss(
-            project=str(project_file),
-            design=DESIGN_NAME,
-            version=version,
-            non_graphical=non_graphical,
-            new_desktop=True,
-        )
-    except TypeError as first_exc:
-        print(f"[ERROR] Hfss.__init__ 返回非None，project路径={project_file}，请检查路径和AEDT版本")
-        time.sleep(5)
+    versions_to_try = [version]
+    if version == "2020.2":
+        versions_to_try.append("2020.1")
+
+    errors: list[str] = []
+    for ver in versions_to_try:
         try:
             return Hfss(
                 project=str(project_file),
                 design=DESIGN_NAME,
-                version=version,
+                version=ver,
                 non_graphical=non_graphical,
-                new_desktop=True,
-                remove_lock=True,
             )
-        except TypeError as second_exc:
-            print(f"[ERROR] Hfss.__init__ 返回非None，project路径={project_file}，请检查路径和AEDT版本")
-            raise RuntimeError(
-                "无法初始化 Hfss 会话。first_try="
-                f"{first_exc}; second_try={second_exc}"
-            ) from second_exc
-        except Exception as second_exc:  # noqa: BLE001
-            raise RuntimeError(
-                "无法初始化 Hfss 会话。first_try="
-                f"{first_exc}; second_try={second_exc}"
-            ) from second_exc
-    except Exception as first_exc:  # noqa: BLE001
-        time.sleep(5)
-        try:
-            return Hfss(
-                project=str(project_file),
-                design=DESIGN_NAME,
-                version=version,
-                non_graphical=non_graphical,
-                new_desktop=True,
-                remove_lock=True,
-            )
-        except TypeError as second_exc:
-            print(f"[ERROR] Hfss.__init__ 返回非None，project路径={project_file}，请检查路径和AEDT版本")
-            raise RuntimeError(
-                "无法初始化 Hfss 会话。first_try="
-                f"{first_exc}; second_try={second_exc}"
-            ) from second_exc
-        except Exception as second_exc:  # noqa: BLE001
-            raise RuntimeError(
-                "无法初始化 Hfss 会话。first_try="
-                f"{first_exc}; second_try={second_exc}"
-            ) from second_exc
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"version={ver}: {exc}")
+            time.sleep(2)
+
+    raise RuntimeError("无法初始化 Hfss 会话。 " + " | ".join(errors))
 
 
 def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
@@ -536,6 +493,15 @@ def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
         return
     try:
         hfss.save_project()
+    except Exception:
+        pass
+    try:
+        hfss.release_desktop(close_projects=False, close_desktop=False)
+    except TypeError:
+        try:
+            hfss.release_desktop(close_projects=False)
+        except Exception:
+            pass
     except Exception:
         pass
     time.sleep(sleep_sec)
@@ -807,7 +773,7 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
         except Exception:
             pass
         time.sleep(3)
-        hfss = _create_hfss_session(Path(project_path), non_graphical=True, version="2025.1")
+        hfss = _create_hfss_session(Path(project_path), non_graphical=True, version="2020.2")
         try:
             _apply_design_variables(hfss, design_vars_opt)
         except Exception as exc2:  # noqa: BLE001
@@ -883,45 +849,6 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
     }, hfss
 
 
-def run_single_simulation(
-    project_path: str,
-    design_vars: DesignVariables,
-    setup_name: str = SETUP_NAME,
-    sweep_name: str = SWEEP_NAME,
-    non_graphical: bool = True,
-    version: str = "2025.1",
-) -> dict[str, Any]:
-    """运行一次仿真并返回结果字典。"""
-    _ = (setup_name, sweep_name)  # 预留参数，当前使用全局 setup/sweep 常量
-
-    if STOP_REQUESTED:
-        raise KeyboardInterrupt("检测到用户中断请求，跳过本次仿真。")
-
-    project_file = Path(project_path).resolve()
-    if not project_file.exists():
-        raise FileNotFoundError(f"HFSS 工程不存在: {project_file}")
-
-    hfss = None
-    try:
-        hfss = _create_hfss_session(project_file, non_graphical=non_graphical, version=version)
-        result, hfss = _evaluate_with_open_hfss(hfss, design_vars, str(project_file))
-        return result
-    except Exception as exc:  # noqa: BLE001
-        if isinstance(exc, KeyboardInterrupt):
-            raise
-        raise RuntimeError(f"仿真失败: {exc}") from exc
-    finally:
-        if hfss is not None:
-            try:
-                hfss.save_project()
-            except Exception:
-                pass
-            try:
-                hfss.release_desktop()
-            except Exception:
-                pass
-
-
 def _objective(result: dict[str, Any]) -> float:
     """最小化目标：频段约束惩罚 + 负增益 + S11 最优值。"""
     freqs = np.asarray(result["s11_curve"]["freq_ghz"], dtype=float)
@@ -960,22 +887,23 @@ def _export_s11_csv(result: dict[str, Any], output_csv: str) -> None:
 
 def run_optimization(
     project_path: str,
-    budget: int = 20,
+    budget: int = 100,
     output_dir: str = "outputs",
-    optimizer: Any = None,
-    skip_already_seen: bool = False,
-    resume_from_checkpoint: bool = True,
 ) -> dict[str, Any]:
-    """调用 optimizer.py + turbo1.py 进行参数优化，并导出结果。"""
+    """调用 SpacePartitioningOptimizer 进行参数优化，并导出结果。"""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    _ensure_numpy_compat()
+    _ensure_sklearn_compat()
 
-    api_config = API_CONFIG
-    if optimizer is None:
-        optimizer = build_optimizer(api_config)
-    checkpoint_file = Path(output_dir) / "checkpoint.json"
-    observations_so_far: list[dict[str, Any]] = []
-    seen_losses: dict[str, float] = {}
-    seen_param_points: list[tuple[dict[str, Any], float]] = []
+    try:
+        import optimizer as local_optimizer
+
+        optimizer_cls = local_optimizer.SpacePartitioningOptimizer
+        _patch_optimizer_config(optimizer_cls)
+        optimizer = optimizer_cls(api_config=API_CONFIG)
+    except Exception as exc:
+        logging.warning("使用 SpacePartitioningOptimizer 失败，退化随机优化器: %s", exc)
+        optimizer = FallbackRandomOptimizer(API_CONFIG)
 
     iter_csv = Path(output_dir) / "optimization_log.csv"
     best_json = Path(output_dir) / "best_result.json"
@@ -984,125 +912,43 @@ def run_optimization(
     best_result: dict[str, Any] | None = None
     best_loss = float("inf")
     default_vars = DesignVariables()
-    start_iter = 1
-
-    if resume_from_checkpoint and checkpoint_file.exists():
-        try:
-            with open(checkpoint_file, "r", encoding="utf-8") as f:
-                ckpt = json.load(f)
-            start_iter = int(ckpt.get("next_iter", 1))
-            best_loss = float(ckpt.get("best_loss", float("inf")))
-            observations_so_far = list(ckpt.get("observations", []))
-            for obs in observations_so_far:
-                if isinstance(obs, dict) and "x" in obs and "loss" in obs:
-                    optimizer.observe([obs["x"]], [obs["loss"]])
-                    loss_obs = float(obs["loss"])
-                    seen_losses[_param_signature(obs["x"])] = loss_obs
-                    seen_param_points.append((obs["x"], loss_obs))
-            print(f"[RESUME] 从第 {start_iter} 轮继续，历史观测 {len(observations_so_far)} 条")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] 检查点读取失败，忽略并从头开始: {exc}")
-            start_iter = 1
-            best_loss = float("inf")
-            observations_so_far = []
-
-    if skip_already_seen:
-        sim_dir = Path(output_dir) / "sim_results"
-        sim_files = sorted(glob.glob(str(sim_dir / "sim_*.json")))
-        for sim_file in sim_files:
-            try:
-                with open(sim_file, "r", encoding="utf-8") as fp:
-                    data = json.load(fp)
-                params = data.get("params", {})
-                loss = float(data.get("result", {}).get("loss"))
-                if isinstance(params, dict) and math.isfinite(loss):
-                    seen_losses[_param_signature(params)] = loss
-                    seen_param_points.append((params, loss))
-            except Exception:
-                continue
-        if seen_losses:
-            logging.info(
-                "已加载 %d 条历史仿真参数用于去重（DEDUP_THRESHOLD=%.1e）。",
-                len(seen_param_points),
-                DEDUP_THRESHOLD,
-            )
 
     project_file = Path(project_path).resolve()
     if not project_file.exists():
         raise FileNotFoundError(f"HFSS 工程不存在: {project_file}")
 
-    try:
-        hfss = _create_hfss_session(project_file, non_graphical=True, version="2025.1")
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"优化前 HFSS 会话初始化失败: {exc}") from exc
+    hfss = _create_hfss_session(project_file, non_graphical=True, version="2020.2")
 
     max_valid_loss: float | None = None
     try:
-        csv_mode = "a" if start_iter > 1 and iter_csv.exists() else "w"
-        with open(iter_csv, csv_mode, newline="", encoding="utf-8-sig") as f:
+        with open(iter_csv, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            if csv_mode == "w":
-                writer.writerow(
-                    [
-                        "iter",
-                        "loss",
-                        "gain_28ghz_db",
-                        "gain_38ghz_db",
-                        "dualband_match_ok",
-                        "design_vars_json",
-                        "error",
-                    ]
-                )
+            writer.writerow(
+                [
+                    "iter",
+                    "loss",
+                    "gain_28ghz_db",
+                    "gain_38ghz_db",
+                    "dualband_match_ok",
+                    "design_vars_json",
+                    "error",
+                ]
+            )
 
-            index_iter = range(start_iter, budget + 1)
-            if tqdm is not None:
-                index_iter = tqdm(
-                    index_iter,
-                    total=budget,
-                    desc="HFSS Optimization",
-                    unit="iter",
-                    dynamic_ncols=True,
-                    leave=True,
-                )
-            else:
-                print("[PROGRESS] 未安装 tqdm，使用普通文本进度输出。可执行: pip install tqdm")
-
-            for i in index_iter:
+            for i in range(1, budget + 1):
                 if STOP_REQUESTED:
                     print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
                     break
 
-                if i > 1 and (i - start_iter) % SESSION_REFRESH_INTERVAL == 0:
+                if i > 1 and (i - 1) % SESSION_REFRESH_INTERVAL == 0:
                     logging.info("第 %d 轮，主动刷新HFSS会话...", i)
-                    try:
-                        hfss.save_project()
-                        hfss.release_desktop()
-                    except Exception:
-                        pass
+                    _cleanup_hfss_session(hfss, sleep_sec=1)
                     time.sleep(3)
-                    hfss = _create_hfss_session(project_file, non_graphical=True, version="2025.1")
+                    hfss = _create_hfss_session(project_file, non_graphical=True, version="2020.2")
                     logging.info("HFSS会话已刷新，新PID已建立")
 
                 cand_raw = optimizer.suggest(1)[0]
-                cand = validate_params(cand_raw, api_config)
-                cand_sig = _param_signature(cand)
-                dup_hist = None
-                if skip_already_seen:
-                    for hist_params, hist_loss in seen_param_points:
-                        if _is_almost_same_params(cand, hist_params, tol=DEDUP_THRESHOLD):
-                            dup_hist = (hist_params, hist_loss)
-                            break
-                if dup_hist is not None:
-                    old_loss = dup_hist[1]
-                    optimizer.observe([cand], [old_loss])
-                    logging.info(
-                        "第 %d 轮建议命中历史参数(容差%.1e)，跳过HFSS仿真。loss=%.4f",
-                        i,
-                        DEDUP_THRESHOLD,
-                        old_loss,
-                    )
-                    writer.writerow([i, old_loss, "", "", "", json.dumps(cand, ensure_ascii=False), "skip_already_seen"])
-                    continue
+                cand = validate_params(cand_raw, API_CONFIG)
                 vars_i = DesignVariables(**{**asdict(default_vars), **cand})
 
                 err_msg = ""
@@ -1136,8 +982,6 @@ def run_optimization(
                     loss = max_valid_loss if max_valid_loss is not None else 500.0
 
                 optimizer.observe([cand], [loss])
-                seen_losses[cand_sig] = float(loss)
-                seen_param_points.append((cand, float(loss)))
 
                 if not err_msg:
                     _save_sim_result(
@@ -1170,31 +1014,24 @@ def run_optimization(
                     best_loss = loss
                     best_result = result
 
-                observations_so_far.append({"x": cand, "loss": float(loss)})
-                ckpt_data = {
-                    "next_iter": i + 1,
-                    "best_loss": float(best_loss),
-                    "observations": observations_so_far,
-                }
-                with open(checkpoint_file, "w", encoding="utf-8") as f:
-                    json.dump(ckpt_data, f, ensure_ascii=False, indent=2)
-
-                try:
-                    hfss.save_project()
-                except Exception:
-                    pass
-
-                print(
-                    f"[{i}/{budget}] loss={loss:.4f} dualband={result.get('dualband_match_ok', False)} "
-                    f"g28={result.get('gain_28ghz_db')} g38={result.get('gain_38ghz_db')}"
+                g28 = float(result.get("gain_28ghz_db", float("nan")))
+                g38 = float(result.get("gain_38ghz_db", float("nan")))
+                dualband_match_ok = bool(result.get("dualband_match_ok", False))
+                logging.info(
+                    "[%d/%d] loss=%.4f g28=%.4f g38=%.4f dual=%s",
+                    i,
+                    budget,
+                    float(loss),
+                    g28,
+                    g38,
+                    dualband_match_ok,
                 )
-                if tqdm is not None and hasattr(index_iter, "set_postfix"):
-                    index_iter.set_postfix(
-                        loss=f"{loss:.3f}",
-                        dual=bool(result.get("dualband_match_ok", False)),
-                    )
     finally:
-        _cleanup_hfss_session(hfss, sleep_sec=2)
+        try:
+            hfss.save_project()
+            hfss.release_desktop()
+        except Exception:
+            pass
 
     if best_result is None:
         final = {
@@ -1212,7 +1049,6 @@ def run_optimization(
 
     with open(best_json, "w", encoding="utf-8") as f:
         json.dump(final, f, ensure_ascii=False, indent=2)
-    checkpoint_file.unlink(missing_ok=True)
 
     return {
         "best_result_json": str(best_json),
@@ -1222,89 +1058,15 @@ def run_optimization(
     }
 
 
-def load_and_reoptimize(sim_results_dir: str, budget: int = 50, output_dir: str = "outputs") -> dict[str, Any]:
-    """读取历史仿真结果，回放观测后做 reload 优化。
-
-    注意：budget 表示“在历史基础上的新增仿真轮数”，不是累计总轮数。
-    """
-    sim_dir = Path(sim_results_dir)
-    files = sorted(glob.glob(str(sim_dir / "sim_*.json")))
-    print(f"[RELOAD] 找到 {len(files)} 条历史仿真记录")
-
-    history: list[tuple[dict[str, float], float]] = []
-    for one_file in files:
-        try:
-            with open(one_file, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
-            params = data.get("params", {})
-            loss = data.get("result", {}).get("loss")
-            if not isinstance(params, dict):
-                continue
-            loss_f = float(loss)
-            if not np.isfinite(loss_f):
-                continue
-            history.append((params, loss_f))
-        except Exception:
-            continue
-
-    print(f"[RELOAD] 其中有效记录 {len(history)} 条")
-
-    optimizer = build_optimizer(API_CONFIG)
-    for params, loss in history:
-        optimizer.observe([params], [loss])
-
-    print("[RELOAD] 历史数据已注入优化器，开始新一轮优化...")
-    return run_optimization(
-        project_path=PROJECT_PATH,
-        budget=budget,
-        output_dir=output_dir,
-        optimizer=optimizer,
-        skip_already_seen=False,
-        resume_from_checkpoint=False,
-    )
-
-
 def main() -> None:
     try:
         _kill_stale_aedt()
-        if RUN_MODE == "single":
-            one_shot = run_single_simulation(
-                project_path=PROJECT_PATH,
-                design_vars=DesignVariables(),
-                setup_name=SETUP_NAME,
-                sweep_name=SWEEP_NAME,
-            )
-            Path("outputs").mkdir(exist_ok=True)
-            with open("outputs/single_run_result.json", "w", encoding="utf-8") as f:
-                json.dump(one_shot, f, ensure_ascii=False, indent=2)
-            _export_s11_csv(one_shot, "outputs/single_run_s11.csv")
-
-            print("\n=== 单次仿真结果 ===")
-            print(
-                json.dumps(
-                    {
-                        "gain_28ghz_db": one_shot["gain_28ghz_db"],
-                        "gain_38ghz_db": one_shot["gain_38ghz_db"],
-                        "dualband_match_ok": one_shot["dualband_match_ok"],
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-
-        elif RUN_MODE == "optimize":
-            opt_result = run_optimization(project_path=PROJECT_PATH, budget=20, output_dir="outputs")
-        elif RUN_MODE == "reload":
-            opt_result = load_and_reoptimize(
-                sim_results_dir="outputs/sim_results",
-                budget=30,  # reload 模式下表示新增 30 轮仿真，而非总轮数
-                output_dir="outputs",
-            )
-        else:
-            raise ValueError(f"未知 RUN_MODE={RUN_MODE!r}，可选: single/optimize/reload")
-
-        print("\n=== 优化结果文件 ===")
-        print(json.dumps(opt_result, ensure_ascii=False, indent=2))
+        opt_result = run_optimization(
+            project_path=PROJECT_PATH,
+            budget=BUDGET,
+            output_dir="outputs",
+        )
+        print(json.dumps(opt_result, indent=2, ensure_ascii=False))
     except KeyboardInterrupt:
         print("\n[INTERRUPT] 用户主动中断，脚本已安全退出。")
 
