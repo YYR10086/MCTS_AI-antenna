@@ -522,34 +522,77 @@ def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
     time.sleep(sleep_sec)
 
 
-def _get_s11_curve(hfss: Hfss) -> tuple[np.ndarray, np.ndarray]:
-    setup_candidates = [
+def _get_s11_curve(hfss):
+    """
+    用底层 COM 接口直接从 HFSS 读取 S11 曲线。
+    兼容 HFSS 2020 R1 PyWin32 模式。
+    """
+    import numpy as np
+
+    # 获取底层 COM 对象
+    odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
+
+    # 方式1：用 PyAEDT get_solution_data，尝试多种 setup_sweep_name 格式
+    setup_sweep_candidates = [
+        "Setup1 : Sweep",
+        "Setup1:Sweep",
+        "Setup1 : LastAdaptive",
+        "Setup1",
         f"{SETUP_NAME} : {SWEEP_NAME}",
         f"{SETUP_NAME}:{SWEEP_NAME}",
         f"{SETUP_NAME} : LastAdaptive",
-        f"{SETUP_NAME}:LastAdaptive",
         SETUP_NAME,
     ]
-    expression_candidates = ["dB(S(1,1))", "S(1,1)"]
-    last_err: Exception | None = None
-
-    for setup in setup_candidates:
-        for expr in expression_candidates:
+    for ss in setup_sweep_candidates:
+        for expr in ["dB(S(1,1))", "dB(S11)", "S11"]:
             try:
-                sol = hfss.post.get_solution_data(expressions=expr, setup_sweep_name=setup)
-                if sol is None or isinstance(sol, bool) or not hasattr(sol, "primary_sweep_values"):
-                    continue
-                freqs = np.array(sol.primary_sweep_values, dtype=float)
-                vals = np.array(sol.data_real(), dtype=float)
-                if freqs.size == 0 or vals.size == 0:
-                    continue
-                if expr == "S(1,1)":
-                    vals = 20.0 * np.log10(np.maximum(np.abs(vals), 1e-15))
-                return freqs, vals
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
+                sol = hfss.post.get_solution_data(
+                    expressions=expr,
+                    setup_sweep_name=ss,
+                )
+                if sol is not None:
+                    freqs = np.array(sol.primary_sweep_values)
+                    vals = np.array([sol.data_db20(expr, i) for i in range(len(freqs))])
+                    if len(freqs) > 0 and np.any(np.isfinite(vals)):
+                        logging.info("S11 提取成功: setup_sweep=%s, expr=%s", ss, expr)
+                        return freqs / 1e9, vals  # 转换为 GHz
+            except Exception:
+                continue
 
-    raise RuntimeError(f"未提取到 S11 曲线，请检查 setup/sweep/expression。last={last_err}")
+    # 方式2：直接用 COM 的 GetSolutionDataEx 读取
+    if odesign is not None:
+        try:
+            oModule = odesign.GetModule("ReportSetup")
+            # 创建临时报告
+            oModule.CreateReport(
+                "S11_temp_report",
+                "Modal Solution Data",
+                "Rectangular Plot",
+                "Setup1 : Sweep",
+                ["Domain:=", "Sweep"],
+                ["Freq:=", ["All"]],
+                ["X Component:=", "Freq", "Y Component:=", ["dB(S(1,1))"]],
+                [],
+            )
+            # 获取数据
+            data = oModule.GetSolutionDataEx(
+                "S11_temp_report",
+                ["dB(S(1,1))"],
+            )
+            freqs = np.array(data[0]) / 1e9
+            s11 = np.array(data[1])
+            # 删除临时报告
+            try:
+                oModule.DeleteReports(["S11_temp_report"])
+            except Exception:
+                pass
+            if len(freqs) > 0:
+                logging.info("S11 提取成功（方式2 COM GetSolutionDataEx）")
+                return freqs, s11
+        except Exception as e:
+            logging.warning("方式2提取S11失败: %s", e)
+
+    raise RuntimeError("所有方式均无法提取 S11 曲线")
 
 
 def _band_ok(freqs: np.ndarray, s11_db: np.ndarray, band: tuple[float, float], threshold: float) -> bool:
@@ -591,9 +634,10 @@ def _peak_from_solution(sol: Any, math_formula: str | None = None) -> float | No
     return float(np.nanmax(vals))
 
 
-def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float) -> float:
+def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float, setup_candidates: list[str] | None = None) -> float:
     preferred_setup = f"{SETUP_NAME} : {SWEEP_NAME}"
-    setup_candidates = [preferred_setup, f"{SETUP_NAME}:{SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
+    if setup_candidates is None:
+        setup_candidates = [preferred_setup, f"{SETUP_NAME}:{SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
     context = FAR_FIELD_SPHERE
     fail_reasons: list[str] = []
 
@@ -704,16 +748,25 @@ def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float) -> float:
 
 
 def _extract_gain_db(hfss: Hfss, target_freq_ghz: float, max_retries: int = 2) -> float:
-    for attempt in range(max_retries):
-        try:
-            gain = _extract_gain_db_once(hfss, target_freq_ghz)
-            if np.isfinite(gain) and -60.0 < gain < GAIN_PHYSICAL_MAX:
-                return gain
-            logging.warning("第%d次提取gain=%.2f无效，等待重试...", attempt + 1, gain)
-            time.sleep(2)
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("第%d次提取增益失败: %s", attempt + 1, exc)
-            time.sleep(2)
+    setup_sweep_candidates = [
+        "Setup1 : Sweep",
+        "Setup1:Sweep",
+        "Setup1 : LastAdaptive",
+        "Setup1",
+        f"{SETUP_NAME} : {SWEEP_NAME}",
+        SETUP_NAME,
+    ]
+    for setup_sweep in setup_sweep_candidates:
+        for attempt in range(max_retries):
+            try:
+                gain = _extract_gain_db_once(hfss, target_freq_ghz, setup_candidates=[setup_sweep])
+                if np.isfinite(gain) and -60.0 < gain < GAIN_PHYSICAL_MAX:
+                    return gain
+                logging.warning("setup=%s 第%d次提取gain=%.2f无效，等待重试...", setup_sweep, attempt + 1, gain)
+                time.sleep(2)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("setup=%s 第%d次提取增益失败: %s", setup_sweep, attempt + 1, exc)
+                time.sleep(2)
     return float("nan")
 
 
