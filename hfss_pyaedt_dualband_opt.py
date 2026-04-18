@@ -390,7 +390,32 @@ def _apply_design_variables(hfss, design_vars: dict):
         # 方式C：hfss[name] 下标赋值
         if not success:
             try:
-                hfss[name] = expr
+                odesign = (
+                    hfss._odesign
+                    if hasattr(hfss, "_odesign") and hfss._odesign is not None
+                    else hfss.odesign
+                    if hasattr(hfss, "odesign")
+                    else None
+                )
+                if odesign is not None:
+                    odesign.SetVariableValue(name, expr)
+                    success = True
+            except Exception as e:
+                logging.warning("方式0b写入 %s 失败: %s", name, e)
+
+        # 方式1a：旧版 PyAEDT COM 接口（odesign，无下划线）
+        if not success:
+            try:
+                hfss._odesign.ChangeProperty(
+                    [
+                        "NAME:AllTabs",
+                        [
+                            "NAME:LocalVariableTab",
+                            ["NAME:PropServers", "LocalVariables"],
+                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                        ],
+                    ]
+                )
                 success = True
                 logging.debug("方式C成功写入 %s=%s", name, expr)
             except Exception as e:
