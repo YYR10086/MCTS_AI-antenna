@@ -513,8 +513,18 @@ def _safe_release(hfss):
     except Exception as e:
         logging.warning("release_desktop 失败（忽略）: %s", e)
 
+    raise RuntimeError(f"所有版本均无法初始化 Hfss 会话: {last_exc}") from last_exc
 
-def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
+
+def _safe_save(hfss: Any) -> None:
+    try:
+        if hfss is not None and hasattr(hfss, "_oproject") and hfss._oproject is not None:
+            hfss.save_project()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("save_project 失败: %s", e)
+
+
+def _safe_release(hfss):
     if hfss is None:
         return
     _safe_save(hfss)
