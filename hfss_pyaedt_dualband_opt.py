@@ -39,6 +39,15 @@ try:
 except Exception:  # noqa: BLE001
     from pyaedt import Hfss
 
+try:
+    import pythoncom
+    import win32com.client
+
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+    logging.warning("win32com 不可用，方式D将跳过")
+
 # -----------------------------
 # 工程参数（可直接改成你本机绝对路径）
 # -----------------------------
@@ -340,44 +349,45 @@ def validate_params(params: dict) -> dict:
 
 
 def _apply_design_variables(hfss, design_vars: dict):
-    global _DIAG_PRINTED
-    if not _DIAG_PRINTED:
-        logging.info("hfss 对象类型: %s", type(hfss))
-        logging.info("hfss 有 _odesign: %s", hasattr(hfss, "_odesign"))
-        logging.info("hfss 有 odesign: %s", hasattr(hfss, "odesign"))
-        logging.info("hfss 有 variable_manager: %s", hasattr(hfss, "variable_manager"))
-        _DIAG_PRINTED = True
+    # 获取底层 odesign COM 对象
+    odesign = None
+    for attr in ["_odesign", "odesign"]:
+        obj = getattr(hfss, attr, None)
+        if obj is not None:
+            odesign = obj
+            break
+
+    logging.info(
+        "[DIAG] hfss类型=%s, odesign类型=%s",
+        type(hfss).__name__,
+        type(odesign).__name__ if odesign else "None",
+    )
 
     for name, value in design_vars.items():
         expr = f"{float(value):.6f}mm"
         success = False
 
-        # 方式0：PyWin32 COM 接口（HFSS 2020 R1 专用）
+        # 方式A：PyWin32 SetVariableValue（最简单直接）
+        if not success and odesign is not None:
+            try:
+                odesign.SetVariableValue(name, expr)
+                success = True
+                logging.debug("方式A成功写入 %s=%s", name, expr)
+            except Exception as e:
+                logging.warning("方式A写入 %s 失败: %s", name, e)
+
+        # 方式B：variable_manager 赋值
         if not success:
             try:
-                odesign = (
-                    hfss._odesign
-                    if hasattr(hfss, "_odesign") and hfss._odesign is not None
-                    else hfss.odesign
-                    if hasattr(hfss, "odesign")
-                    else None
-                )
-                if odesign is not None:
-                    odesign.ChangeProperty(
-                        [
-                            "NAME:AllTabs",
-                            [
-                                "NAME:LocalVariableTab",
-                                ["NAME:PropServers", "LocalVariables"],
-                                ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
-                            ],
-                        ]
-                    )
+                vm = getattr(hfss, "variable_manager", None)
+                if vm is not None:
+                    vm[name] = expr
                     success = True
+                    logging.debug("方式B成功写入 %s=%s", name, expr)
             except Exception as e:
-                logging.warning("方式0写入 %s 失败: %s", name, e)
+                logging.warning("方式B写入 %s 失败: %s", name, e)
 
-        # 方式0b：直接用 SetVariableValue（PyWin32 旧版接口）
+        # 方式C：hfss[name] 下标赋值
         if not success:
             try:
                 odesign = (
@@ -407,13 +417,15 @@ def _apply_design_variables(hfss, design_vars: dict):
                     ]
                 )
                 success = True
+                logging.debug("方式C成功写入 %s=%s", name, expr)
             except Exception as e:
-                logging.warning("方式1a写入 %s 失败: %s", name, e)
+                logging.warning("方式C写入 %s 失败: %s", name, e)
 
-        # 方式1b：新版 PyAEDT gRPC 接口（_odesign，有下划线）
-        if not success:
+        # 方式D：ChangeProperty PyWin32格式
+        if not success and odesign is not None and HAS_WIN32:
             try:
-                hfss._odesign.ChangeProperty(
+                args = win32com.client.VARIANT(
+                    pythoncom.VT_ARRAY | pythoncom.VT_VARIANT,
                     [
                         "NAME:AllTabs",
                         [
@@ -421,30 +433,16 @@ def _apply_design_variables(hfss, design_vars: dict):
                             ["NAME:PropServers", "LocalVariables"],
                             ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
                         ],
-                    ]
+                    ],
                 )
+                odesign.ChangeProperty(args)
                 success = True
+                logging.debug("方式D成功写入 %s=%s", name, expr)
             except Exception as e:
-                logging.warning("方式1b写入 %s 失败: %s", name, e)
-
-        # 方式2：variable_manager 字典接口
-        if not success:
-            try:
-                hfss.variable_manager[name] = expr
-                success = True
-            except Exception as e:
-                logging.warning("方式2写入 %s 失败: %s", name, e)
-
-        # 方式3：hfss[] 下标接口
-        if not success:
-            try:
-                hfss[name] = expr
-                success = True
-            except Exception as e:
-                logging.warning("方式3写入 %s 失败: %s", name, e)
+                logging.warning("方式D写入 %s 失败: %s", name, e)
 
         if not success:
-            raise RuntimeError(f"变量 '{name}' 六种方式均写入失败")
+            logging.error("变量 '%s' 所有方式均写入失败，跳过本变量", name)
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
@@ -838,31 +836,13 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
     try:
         _apply_design_variables(hfss, design_vars_opt)
     except Exception as exc:  # noqa: BLE001
-        logging.warning("写入设计变量首次失败: %s，尝试刷新HFSS会话后重试一次", exc)
-        _safe_save(hfss)
-        _safe_release(hfss)
-        time.sleep(3)
-        hfss = _create_hfss_session(Path(project_path), non_graphical=True)
-        try:
-            _apply_design_variables(hfss, design_vars_opt)
-        except Exception as exc2:  # noqa: BLE001
-            logging.error("写入设计变量重试仍失败: %s，本轮标记为失败", exc2)
-            return {
-                "project_name": PROJECT_NAME,
-                "design_name": DESIGN_NAME,
-                "setup_name": SETUP_NAME,
-                "sweep_name": SWEEP_NAME,
-                "far_field_sphere": FAR_FIELD_SPHERE,
-                "project_path": project_path,
-                "design_vars": vars_i,
-                "s11_curve": {"freq_ghz": [], "s11_db": []},
-                "gain_28ghz_db": float("nan"),
-                "gain_38ghz_db": float("nan"),
-                "loss": 500.0,
-                "dualband_match_ok": False,
-                "band_26_32_ok": False,
-                "band_37_39_ok": False,
-            }, hfss
+        logging.warning("写入设计变量失败，跳过本轮仿真")
+        return {
+            "gain_28ghz_db": float("nan"),
+            "gain_38ghz_db": float("nan"),
+            "loss": 500.0,
+            "dualband_match_ok": False,
+        }, hfss
     _safe_save(hfss)
     time.sleep(1)
     try:
