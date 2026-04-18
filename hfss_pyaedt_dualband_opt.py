@@ -623,14 +623,6 @@ def _peak_from_solution(sol: Any, math_formula: str | None = None) -> float | No
     return float(np.nanmax(vals))
 
 
-def _check_geometry_valid(hfss: Hfss) -> bool:
-    try:
-        _ = hfss.odesign.GetChildObject("Model").GetChildNames()
-        return True
-    except Exception:
-        return False
-
-
 def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float) -> float:
     preferred_setup = f"{SETUP_NAME} : {SWEEP_NAME}"
     setup_candidates = [preferred_setup, f"{SETUP_NAME}:{SWEEP_NAME}", f"{SETUP_NAME} : LastAdaptive", SETUP_NAME]
@@ -833,18 +825,6 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
 
     # 步骤3：运行仿真
     try:
-        try:
-            hfss.delete_solution_data()
-        except Exception:
-            pass
-        try:
-            hfss.odesign.DeleteFullVariation("All", False)
-        except Exception:
-            pass
-        if not _check_geometry_valid(hfss):
-            raise RuntimeError("几何模型无效，跳过本轮仿真")
-        if STOP_REQUESTED:
-            raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
         logging.info("[EVAL] 步骤3：analyze_setup 开始")
         _run_analyze_with_interrupt(hfss, SETUP_NAME)
         logging.info("[EVAL] 步骤3：完成")
