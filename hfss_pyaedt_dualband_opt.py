@@ -513,8 +513,18 @@ def _safe_release(hfss):
     except Exception as e:
         logging.warning("release_desktop 失败（忽略）: %s", e)
 
+    raise RuntimeError(f"所有版本均无法初始化 Hfss 会话: {last_exc}") from last_exc
 
-def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
+
+def _safe_save(hfss: Any) -> None:
+    try:
+        if hfss is not None and hasattr(hfss, "_oproject") and hfss._oproject is not None:
+            hfss.save_project()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("save_project 失败: %s", e)
+
+
+def _safe_release(hfss):
     if hfss is None:
         return
     _safe_save(hfss)
@@ -524,75 +534,72 @@ def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
 
 def _get_s11_curve(hfss):
     """
-    用底层 COM 接口直接从 HFSS 读取 S11 曲线。
-    兼容 HFSS 2020 R1 PyWin32 模式。
+    通过 HFSS ExportToFile 导出 S11 数据到 CSV，再读取。
+    完全绕过 PyAEDT post 接口，兼容 HFSS 2020 R1 PyWin32 模式。
     """
     import numpy as np
+    import csv
+    import tempfile
+    import os
 
-    # 获取底层 COM 对象
     odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
+    if odesign is None:
+        raise RuntimeError("无法获取 odesign COM 对象")
 
-    # 方式1：用 PyAEDT get_solution_data，尝试多种 setup_sweep_name 格式
-    setup_sweep_candidates = [
+    oModule = odesign.GetModule("ReportSetup")
+
+    # 创建临时文件路径
+    tmp_file = os.path.join(tempfile.gettempdir(), "hfss_s11_export.csv")
+
+    # 删除旧报告（如果存在）
+    try:
+        oModule.DeleteReports(["S11_opt_report"])
+    except Exception:
+        pass
+
+    # 创建 S11 报告
+    oModule.CreateReport(
+        "S11_opt_report",
+        "Modal Solution Data",
+        "Rectangular Plot",
         "Setup1 : Sweep",
-        "Setup1:Sweep",
-        "Setup1 : LastAdaptive",
-        "Setup1",
-        f"{SETUP_NAME} : {SWEEP_NAME}",
-        f"{SETUP_NAME}:{SWEEP_NAME}",
-        f"{SETUP_NAME} : LastAdaptive",
-        SETUP_NAME,
-    ]
-    for ss in setup_sweep_candidates:
-        for expr in ["dB(S(1,1))", "dB(S11)", "S11"]:
-            try:
-                sol = hfss.post.get_solution_data(
-                    expressions=expr,
-                    setup_sweep_name=ss,
-                )
-                if sol is not None:
-                    freqs = np.array(sol.primary_sweep_values)
-                    vals = np.array([sol.data_db20(expr, i) for i in range(len(freqs))])
-                    if len(freqs) > 0 and np.any(np.isfinite(vals)):
-                        logging.info("S11 提取成功: setup_sweep=%s, expr=%s", ss, expr)
-                        return freqs / 1e9, vals  # 转换为 GHz
-            except Exception:
-                continue
+        ["Domain:=", "Sweep"],
+        ["Freq:=", ["All"]],
+        ["X Component:=", "Freq", "Y Component:=", ["dB(S(Port1,Port1))"]],
+        [],
+    )
 
-    # 方式2：直接用 COM 的 GetSolutionDataEx 读取
-    if odesign is not None:
-        try:
-            oModule = odesign.GetModule("ReportSetup")
-            # 创建临时报告
-            oModule.CreateReport(
-                "S11_temp_report",
-                "Modal Solution Data",
-                "Rectangular Plot",
-                "Setup1 : Sweep",
-                ["Domain:=", "Sweep"],
-                ["Freq:=", ["All"]],
-                ["X Component:=", "Freq", "Y Component:=", ["dB(S(1,1))"]],
-                [],
-            )
-            # 获取数据
-            data = oModule.GetSolutionDataEx(
-                "S11_temp_report",
-                ["dB(S(1,1))"],
-            )
-            freqs = np.array(data[0]) / 1e9
-            s11 = np.array(data[1])
-            # 删除临时报告
-            try:
-                oModule.DeleteReports(["S11_temp_report"])
-            except Exception:
-                pass
-            if len(freqs) > 0:
-                logging.info("S11 提取成功（方式2 COM GetSolutionDataEx）")
-                return freqs, s11
-        except Exception as e:
-            logging.warning("方式2提取S11失败: %s", e)
+    # 导出到 CSV
+    oModule.ExportToFile("S11_opt_report", tmp_file)
 
-    raise RuntimeError("所有方式均无法提取 S11 曲线")
+    # 删除报告
+    try:
+        oModule.DeleteReports(["S11_opt_report"])
+    except Exception:
+        pass
+
+    # 读取 CSV
+    freqs, s11_vals = [], []
+    with open(tmp_file, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        next(reader)  # 跳过表头
+        for row in reader:
+            if len(row) >= 2:
+                try:
+                    freqs.append(float(row[0]))
+                    s11_vals.append(float(row[1]))
+                except ValueError:
+                    continue
+
+    os.remove(tmp_file)
+
+    if not freqs:
+        raise RuntimeError("S11 CSV 文件为空或格式错误")
+
+    freqs = np.array(freqs) / 1e9  # Hz 转 GHz
+    s11_vals = np.array(s11_vals)
+    logging.info("S11 提取成功，频率点数=%d，范围=%.1f~%.1f GHz", len(freqs), freqs[0], freqs[-1])
+    return freqs, s11_vals
 
 
 def _band_ok(freqs: np.ndarray, s11_db: np.ndarray, band: tuple[float, float], threshold: float) -> bool:
@@ -747,27 +754,83 @@ def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float, setup_candidates: 
     return float("nan")
 
 
-def _extract_gain_db(hfss: Hfss, target_freq_ghz: float, max_retries: int = 2) -> float:
-    setup_sweep_candidates = [
-        "Setup1 : Sweep",
-        "Setup1:Sweep",
-        "Setup1 : LastAdaptive",
-        "Setup1",
-        f"{SETUP_NAME} : {SWEEP_NAME}",
-        SETUP_NAME,
-    ]
-    for setup_sweep in setup_sweep_candidates:
-        for attempt in range(max_retries):
-            try:
-                gain = _extract_gain_db_once(hfss, target_freq_ghz, setup_candidates=[setup_sweep])
-                if np.isfinite(gain) and -60.0 < gain < GAIN_PHYSICAL_MAX:
-                    return gain
-                logging.warning("setup=%s 第%d次提取gain=%.2f无效，等待重试...", setup_sweep, attempt + 1, gain)
-                time.sleep(2)
-            except Exception as exc:  # noqa: BLE001
-                logging.warning("setup=%s 第%d次提取增益失败: %s", setup_sweep, attempt + 1, exc)
-                time.sleep(2)
-    return float("nan")
+def _extract_gain_db(hfss, freq_ghz):
+    """
+    通过导出远场报告 CSV 文件提取指定频率的最大增益。
+    """
+    import numpy as np
+    import csv
+    import tempfile
+    import os
+
+    odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
+    if odesign is None:
+        return float("nan")
+
+    oModule = odesign.GetModule("ReportSetup")
+    report_name = f"Gain_{int(freq_ghz)}GHz_opt"
+    tmp_file = os.path.join(tempfile.gettempdir(), f"hfss_gain_{int(freq_ghz)}g.csv")
+
+    try:
+        oModule.DeleteReports([report_name])
+    except Exception:
+        pass
+
+    try:
+        # 创建远场增益报告，固定频率，扫描 Theta
+        oModule.CreateReport(
+            report_name,
+            "Far Fields",
+            "Rectangular Plot",
+            "Setup1 : LastAdaptive",
+            [
+                "Context:=",
+                "3D",
+                "SourceContext:=",
+                "",
+            ],
+            [
+                "Freq:=",
+                [f"{freq_ghz}GHz"],
+                "Phi:=",
+                ["0deg"],
+                "Theta:=",
+                ["All"],
+            ],
+            ["X Component:=", "Theta", "Y Component:=", ["GainTotal"]],
+            [],
+        )
+
+        oModule.ExportToFile(report_name, tmp_file)
+
+        try:
+            oModule.DeleteReports([report_name])
+        except Exception:
+            pass
+
+        gains = []
+        with open(tmp_file, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            next(reader)
+            for row in reader:
+                if len(row) >= 2:
+                    try:
+                        gains.append(float(row[1]))
+                    except ValueError:
+                        continue
+
+        os.remove(tmp_file)
+
+        if not gains:
+            return float("nan")
+
+        max_gain = max(gains)
+        logging.info("增益提取成功: freq=%.1fGHz, max_gain=%.2f dBi", freq_ghz, max_gain)
+        return max_gain
+
+    except Exception as e:
+        logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, e)
+        return float("nan")
 
 
 def _save_sim_result(output_dir: str, design_vars: dict[str, Any], result_dict: dict[str, Any]) -> None:
