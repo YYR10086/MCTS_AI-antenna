@@ -338,56 +338,48 @@ def validate_params(params: dict) -> dict:
     return fixed
 
 
-def _apply_design_variables(hfss: Hfss, design_vars: dict[str, float]) -> None:
-    """将优化参数写入 HFSS；若存在变量写入失败则抛出异常。"""
-    try:
-        existing_vars = set(hfss.variable_manager.variable_names)
-    except Exception:
-        existing_vars = None  # 获取失败则不过滤，尝试全部写入
-
-    failed_vars: list[str] = []
+def _apply_design_variables(hfss, design_vars: dict) -> None:
     for name, value in design_vars.items():
-        if existing_vars is not None and name not in existing_vars:
-            logging.warning("变量 '%s' 在HFSS设计中不存在，跳过写入", name)
-            continue
         expr = f"{float(value):.6f}mm"
         success = False
 
-        # 方式1：高层变量管理接口
+        # 方式1：最底层 odesign 直接调用（兼容所有 PyAEDT 版本）
         try:
-            hfss.variable_manager[name] = expr
+            hfss.odesign.ChangeProperty(
+                [
+                    "NAME:AllTabs",
+                    [
+                        "NAME:LocalVariableTab",
+                        ["NAME:PropServers", "LocalVariables"],
+                        [
+                            "NAME:ChangedProps",
+                            ["NAME:" + name, "Value:=", expr],
+                        ],
+                    ],
+                ]
+            )
             success = True
-        except Exception:
-            pass
+        except Exception as e1:  # noqa: BLE001
+            logging.warning("方式1写入 %s 失败: %s", name, e1)
 
-        # 方式2：对象索引接口
+        # 方式2：variable_manager 字典接口
+        if not success:
+            try:
+                hfss.variable_manager[name] = expr
+                success = True
+            except Exception as e2:  # noqa: BLE001
+                logging.warning("方式2写入 %s 失败: %s", name, e2)
+
+        # 方式3：hfss[] 下标接口
         if not success:
             try:
                 hfss[name] = expr
                 success = True
-            except Exception:
-                pass
+            except Exception as e3:  # noqa: BLE001
+                logging.warning("方式3写入 %s 失败: %s", name, e3)
 
-        # 方式3：最底层 ChangeProperty 接口
         if not success:
-            try:
-                hfss.odesign.ChangeProperty(
-                    [
-                        "NAME:AllTabs",
-                        [
-                            "NAME:LocalVariableTab",
-                            ["NAME:PropServers", "LocalVariables"],
-                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
-                        ],
-                    ]
-                )
-                success = True
-            except Exception as exc:  # noqa: BLE001
-                logging.error("变量 '%s' 三种方式均写入失败: %s", name, exc)
-                failed_vars.append(name)
-
-        if success:
-            logging.debug("变量 '%s' = %s 写入成功", name, expr)
+            raise RuntimeError(f"变量 '{name}' 三种方式均写入失败，终止本轮仿真")
 
     if failed_vars:
         raise RuntimeError(f"设计变量写入失败: {', '.join(failed_vars)}")
@@ -501,22 +493,27 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
     raise RuntimeError("无法初始化 Hfss 会话。 " + " | ".join(errors))
 
 
+def _safe_save(hfss: Any) -> None:
+    try:
+        if hfss is not None and hasattr(hfss, "_oproject") and hfss._oproject is not None:
+            hfss.save_project()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("save_project 失败: %s", e)
+
+
+def _safe_release(hfss: Any) -> None:
+    try:
+        if hfss is not None and hasattr(hfss, "release_desktop"):
+            hfss.release_desktop()
+    except Exception as e:  # noqa: BLE001
+        logging.warning("release_desktop 失败: %s", e)
+
+
 def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
     if hfss is None:
         return
-    try:
-        hfss.save_project()
-    except Exception:
-        pass
-    try:
-        hfss.release_desktop(close_projects=False, close_desktop=False)
-    except TypeError:
-        try:
-            hfss.release_desktop(close_projects=False)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    _safe_save(hfss)
+    _safe_release(hfss)
     time.sleep(sleep_sec)
 
 
@@ -777,14 +774,8 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
         _apply_design_variables(hfss, design_vars_opt)
     except Exception as exc:  # noqa: BLE001
         logging.warning("写入设计变量首次失败: %s，尝试刷新HFSS会话后重试一次", exc)
-        try:
-            hfss.save_project()
-        except Exception:
-            pass
-        try:
-            hfss.release_desktop()
-        except Exception:
-            pass
+        _safe_save(hfss)
+        _safe_release(hfss)
         time.sleep(3)
         hfss = _create_hfss_session(Path(project_path), non_graphical=True, version="2020.2")
         try:
@@ -807,10 +798,7 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
                 "band_26_32_ok": False,
                 "band_37_39_ok": False,
             }, hfss
-    try:
-        hfss.save_project()
-    except Exception:
-        pass
+    _safe_save(hfss)
     time.sleep(1)
     try:
         hfss.delete_solution_data()
@@ -909,14 +897,13 @@ def run_optimization(
     _ensure_sklearn_compat()
 
     try:
-        import optimizer as local_optimizer
+        from optimizer import SpacePartitioningOptimizer
 
-        optimizer_cls = local_optimizer.SpacePartitioningOptimizer
-        _patch_optimizer_config(optimizer_cls)
-        optimizer = optimizer_cls(api_config=API_CONFIG)
-    except Exception as exc:
-        logging.warning("使用 SpacePartitioningOptimizer 失败，退化随机优化器: %s", exc)
-        optimizer = FallbackRandomOptimizer(API_CONFIG)
+        optimizer = SpacePartitioningOptimizer(api_config=API_CONFIG)
+        logging.info("优化器初始化成功: SpacePartitioningOptimizer")
+    except Exception as e:  # noqa: BLE001
+        logging.error("SpacePartitioningOptimizer 初始化失败: %s", e)
+        raise RuntimeError("优化器初始化失败，请检查依赖库") from e
 
     iter_csv = Path(output_dir) / "optimization_log.csv"
     best_json = Path(output_dir) / "best_result.json"
@@ -1041,8 +1028,8 @@ def run_optimization(
                 )
     finally:
         try:
-            hfss.save_project()
-            hfss.release_desktop()
+            _safe_save(hfss)
+            _safe_release(hfss)
         except Exception:
             pass
 
@@ -1073,6 +1060,9 @@ def run_optimization(
 
 def main() -> None:
     try:
+        import pyaedt
+
+        logging.info("PyAEDT 版本: %s", pyaedt.__version__)
         _kill_stale_aedt()
         opt_result = run_optimization(
             project_path=PROJECT_PATH,
