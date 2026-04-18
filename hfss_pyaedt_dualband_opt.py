@@ -22,7 +22,6 @@ import logging
 import math
 import os
 import platform
-import signal
 import subprocess
 import threading
 import time
@@ -110,17 +109,6 @@ OPT_PARAM_NAMES = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-def _request_stop(signum, _frame) -> None:
-    """捕获 Ctrl+C / 终止信号，安全中断当前批次流程。"""
-    global STOP_REQUESTED
-    STOP_REQUESTED = True
-    print(f"\n[INTERRUPT] 收到信号 {signum}，将在当前步骤后安全退出。")
-
-
-signal.signal(signal.SIGINT, _request_stop)
-signal.signal(signal.SIGTERM, _request_stop)
-
-
 def _kill_stale_aedt() -> None:
     """强制结束所有残留的 AEDT 进程（仅 Windows）。"""
     if platform.system() != "Windows":
@@ -168,57 +156,37 @@ class AnalyzeHeartbeat:
         print(f"[PROGRESS] {self.tag} 结束，总耗时 {elapsed:.1f}s")
 
 
-def _request_aedt_stop(hfss: Hfss) -> None:
-    """尽力请求 AEDT 停止当前仿真。"""
-    stop_calls = [
-        ("hfss.stop_simulations", lambda: hfss.stop_simulations()),
-        ("hfss.odesktop.StopSimulations", lambda: hfss.odesktop.StopSimulations()),
-        ("hfss.desktop_class.odesktop.StopSimulations", lambda: hfss.desktop_class.odesktop.StopSimulations()),
-    ]
-    for tag, fn in stop_calls:
-        try:
-            fn()
-            print(f"[INTERRUPT] 已发送停止命令: {tag}")
-            return
-        except Exception:
-            continue
-    print("[INTERRUPT] 未找到可用停止接口，请等待当前求解步结束。")
-
-
-def _run_analyze_with_interrupt(hfss: Hfss, setup_name: str) -> None:
+def _run_analyze_with_interrupt(hfss, setup_name):
     """
-    在后台线程执行 analyze_setup，主线程轮询中断并尝试停止 AEDT 求解。
+    直接在主线程调用 analyze_setup。
+    PyWin32 COM 对象不支持跨线程调用，必须在主线程执行。
     """
-    box: dict[str, Any] = {"exc": None}
+    # 优先使用最底层的 odesign.Analyze，绕过 PyAEDT 的 DSO 注册表检查
+    analyzed = False
 
-    def _target():
+    # 方式1：直接用 odesign.Analyze（绕过 GetRegistryString）
+    try:
+        odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
+        if odesign is not None:
+            logging.info("[ANALYZE] 使用 odesign.Analyze('%s')", setup_name)
+            odesign.Analyze(setup_name)
+            analyzed = True
+            logging.info("[ANALYZE] odesign.Analyze 完成")
+    except Exception as e:
+        logging.warning("[ANALYZE] 方式1失败: %s", e)
+
+    # 方式2：PyAEDT 高层接口
+    if not analyzed:
         try:
-            try:
-                hfss.analyze_setup(setup_name)
-            except TypeError:
-                hfss.odesign.Analyze(setup_name)
-        except Exception as exc:  # noqa: BLE001
-            box["exc"] = exc
+            logging.info("[ANALYZE] 使用 hfss.analyze_setup('%s')", setup_name)
+            hfss.analyze_setup(setup_name)
+            analyzed = True
+            logging.info("[ANALYZE] hfss.analyze_setup 完成")
+        except Exception as e:
+            logging.warning("[ANALYZE] 方式2失败: %s", e)
+            raise
 
-    thread = threading.Thread(target=_target, daemon=True)
-    thread.start()
-
-    while thread.is_alive():
-        if STOP_REQUESTED:
-            _request_aedt_stop(hfss)
-            thread.join(timeout=8.0)
-            raise KeyboardInterrupt("用户中断：已请求停止 HFSS 仿真。")
-        thread.join(timeout=1.0)
-
-    if box["exc"] is not None:
-        print("[DIAG] Setup求解失败，尝试获取HFSS消息日志...")
-        try:
-            msgs = hfss.odesktop.GetMessages("", "", 2)
-            for m in (msgs or [])[-10:]:
-                print(f"[HFSS MSG] {m}")
-        except Exception:
-            pass
-        raise box["exc"]
+    return analyzed
 
 
 @dataclass
