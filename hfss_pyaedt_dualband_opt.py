@@ -61,6 +61,7 @@ GAIN_PHYSICAL_MAX = 30.0
 DEDUP_THRESHOLD = 1e-4  # 仅将“数值误差级别”的参数差异视为重复
 SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
 BUDGET = 100  # 服务器上一次跑100轮
+_DIAG_PRINTED = False
 
 API_CONFIG = {
     "W": {"type": "real", "space": "linear", "range": (12.0, 20.0)},
@@ -339,14 +340,63 @@ def validate_params(params: dict) -> dict:
 
 
 def _apply_design_variables(hfss, design_vars: dict):
+    global _DIAG_PRINTED
+    if not _DIAG_PRINTED:
+        logging.info("hfss 对象类型: %s", type(hfss))
+        logging.info("hfss 有 _odesign: %s", hasattr(hfss, "_odesign"))
+        logging.info("hfss 有 odesign: %s", hasattr(hfss, "odesign"))
+        logging.info("hfss 有 variable_manager: %s", hasattr(hfss, "variable_manager"))
+        _DIAG_PRINTED = True
+
     for name, value in design_vars.items():
         expr = f"{float(value):.6f}mm"
         success = False
 
+        # 方式0：PyWin32 COM 接口（HFSS 2020 R1 专用）
+        if not success:
+            try:
+                odesign = (
+                    hfss._odesign
+                    if hasattr(hfss, "_odesign") and hfss._odesign is not None
+                    else hfss.odesign
+                    if hasattr(hfss, "odesign")
+                    else None
+                )
+                if odesign is not None:
+                    odesign.ChangeProperty(
+                        [
+                            "NAME:AllTabs",
+                            [
+                                "NAME:LocalVariableTab",
+                                ["NAME:PropServers", "LocalVariables"],
+                                ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                            ],
+                        ]
+                    )
+                    success = True
+            except Exception as e:
+                logging.warning("方式0写入 %s 失败: %s", name, e)
+
+        # 方式0b：直接用 SetVariableValue（PyWin32 旧版接口）
+        if not success:
+            try:
+                odesign = (
+                    hfss._odesign
+                    if hasattr(hfss, "_odesign") and hfss._odesign is not None
+                    else hfss.odesign
+                    if hasattr(hfss, "odesign")
+                    else None
+                )
+                if odesign is not None:
+                    odesign.SetVariableValue(name, expr)
+                    success = True
+            except Exception as e:
+                logging.warning("方式0b写入 %s 失败: %s", name, e)
+
         # 方式1a：旧版 PyAEDT COM 接口（odesign，无下划线）
         if not success:
             try:
-                hfss.odesign.ChangeProperty(
+                hfss._odesign.ChangeProperty(
                     [
                         "NAME:AllTabs",
                         [
@@ -394,7 +444,7 @@ def _apply_design_variables(hfss, design_vars: dict):
                 logging.warning("方式3写入 %s 失败: %s", name, e)
 
         if not success:
-            raise RuntimeError(f"变量 '{name}' 四种方式均写入失败")
+            raise RuntimeError(f"变量 '{name}' 六种方式均写入失败")
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
