@@ -83,7 +83,7 @@ class SpacePartitioningOptimizer(AbstractOptimizer):
     self.init_batches = []
 
   def _read_config(self):
-    return {'turbo_training_steps': 100, 'turbo_length_retries': 10, 'turbo_length_init_method': 'default', 'experimental_design': 'lhs_classic_ratio', 'n_init_points': 24, 'max_tree_depth': 5, 'kmeans_resplits': 10, 'split_model': {'type': 'SVC', 'args': {'kernel': 'poly', 'gamma': 'scale', 'C': 745.3227447730735}}, 'reset_no_improvement': 8, 'reset_split_after': 4, 'turbo': {'budget': 128, 'use_cylinder': 0, 'use_pull': 0, 'use_lcb': 0, 'kappa': 2.0, 'use_hetero_lcb': 1, 'hetero_beta0': 2.2, 'hetero_beta1': 0.8, 'hetero_noise_penalty': 0.35, 'hetero_k_neighbors': 6, 'use_decay': 1, 'decay_alpha': 0.49937937259674076, 'decay_threshold': 0.5, 'length_min': 1e-06, 'length_max': 2.0, 'length_init': 0.8, 'length_multiplier': 2.0}, 'sampler_seed': 42, 'optimizer_seed': 578330}
+    return {'turbo_training_steps': 100, 'turbo_length_retries': 10, 'turbo_length_init_method': 'default', 'experimental_design': 'lhs_classic_ratio', 'n_init_points': 24, 'max_tree_depth': 5, 'kmeans_resplits': 10, 'split_model': {'type': 'SVC', 'args': {'kernel': 'poly', 'gamma': 'scale', 'C': 745.3227447730735}}, 'reset_no_improvement': 1000000, 'reset_split_after': 4, 'turbo': {'budget': 128, 'use_cylinder': 0, 'use_pull': 0, 'use_lcb': 0, 'kappa': 2.0, 'use_hetero_lcb': 1, 'hetero_beta0': 2.2, 'hetero_beta1': 0.8, 'hetero_noise_penalty': 0.35, 'hetero_k_neighbors': 6, 'use_decay': 1, 'decay_alpha': 0.49937937259674076, 'decay_threshold': 0.5, 'length_min': 1e-06, 'length_max': 2.0, 'length_init': 0.8, 'length_multiplier': 2.0}, 'sampler_seed': 42, 'optimizer_seed': 578330}
 
   def _init(self, n_suggestions):
     self.batch_size = n_suggestions
