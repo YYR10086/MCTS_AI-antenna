@@ -339,12 +339,13 @@ def validate_params(params: dict[str, float], api_config: dict[str, dict[str, An
 
 
 def _apply_design_variables(hfss: Hfss, design_vars: dict[str, float]) -> None:
-    """将优化参数写入 HFSS；不存在或写入失败的变量将被跳过。"""
+    """将优化参数写入 HFSS；若存在变量写入失败则抛出异常。"""
     try:
         existing_vars = set(hfss.variable_manager.variable_names)
     except Exception:
         existing_vars = None  # 获取失败则不过滤，尝试全部写入
 
+    failed_vars: list[str] = []
     for name, value in design_vars.items():
         if existing_vars is not None and name not in existing_vars:
             logging.warning("变量 '%s' 在HFSS设计中不存在，跳过写入", name)
@@ -383,9 +384,13 @@ def _apply_design_variables(hfss: Hfss, design_vars: dict[str, float]) -> None:
                 success = True
             except Exception as exc:  # noqa: BLE001
                 logging.error("变量 '%s' 三种方式均写入失败: %s", name, exc)
+                failed_vars.append(name)
 
         if success:
             logging.debug("变量 '%s' = %s 写入成功", name, expr)
+
+    if failed_vars:
+        raise RuntimeError(f"设计变量写入失败: {', '.join(failed_vars)}")
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
