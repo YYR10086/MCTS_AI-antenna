@@ -343,24 +343,36 @@ def _apply_design_variables(hfss, design_vars: dict) -> None:
         expr = f"{float(value):.6f}mm"
         success = False
 
-        # 方式1：最底层 odesign 直接调用（兼容所有 PyAEDT 版本）
-        try:
-            hfss.odesign.ChangeProperty(
+        change_payload = [
+            "NAME:AllTabs",
+            [
+                "NAME:LocalVariableTab",
+                ["NAME:PropServers", "LocalVariables"],
                 [
-                    "NAME:AllTabs",
-                    [
-                        "NAME:LocalVariableTab",
-                        ["NAME:PropServers", "LocalVariables"],
-                        [
-                            "NAME:ChangedProps",
-                            ["NAME:" + name, "Value:=", expr],
-                        ],
-                    ],
-                ]
-            )
+                    "NAME:ChangedProps",
+                    ["NAME:" + name, "Value:=", expr],
+                ],
+            ],
+        ]
+
+        # 方式1a：新版 PyAEDT（_odesign，gRPC）
+        try:
+            hfss._odesign.ChangeProperty(change_payload)
             success = True
-        except Exception as e1:  # noqa: BLE001
-            logging.warning("方式1写入 %s 失败: %s", name, e1)
+        except AttributeError:
+            pass
+        except Exception as e1a:  # noqa: BLE001
+            logging.warning("方式1a失败: %s", e1a)
+
+        # 方式1b：旧版 PyAEDT（odesign，COM）
+        if not success:
+            try:
+                hfss.odesign.ChangeProperty(change_payload)
+                success = True
+            except AttributeError:
+                pass
+            except Exception as e1b:  # noqa: BLE001
+                logging.warning("方式1b失败: %s", e1b)
 
         # 方式2：variable_manager 字典接口
         if not success:
@@ -380,9 +392,6 @@ def _apply_design_variables(hfss, design_vars: dict) -> None:
 
         if not success:
             raise RuntimeError(f"变量 '{name}' 三种方式均写入失败，终止本轮仿真")
-
-    if failed_vars:
-        raise RuntimeError(f"设计变量写入失败: {', '.join(failed_vars)}")
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
@@ -459,7 +468,7 @@ def _attach_existing_hfss(project_file: Path, non_graphical: bool, version: str)
     raise RuntimeError("附着已打开 HFSS 会话失败: " + " | ".join(attach_errors))
 
 
-def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
+def _create_hfss_session(project_file: Path, non_graphical: bool = True, version: str | None = None):
     project_file = Path(project_file).resolve()
     if not project_file.exists():
         raise FileNotFoundError(f"HFSS 工程文件不存在: {project_file}")
@@ -473,24 +482,26 @@ def _create_hfss_session(project_file: Path, non_graphical: bool, version: str):
         except Exception as exc:  # noqa: BLE001
             print(f"[LOCK] 删除锁文件失败: {exc}")
 
-    versions_to_try = [version]
-    if version == "2020.2":
-        versions_to_try.append("2020.1")
-
-    errors: list[str] = []
+    versions_to_try = ["2020.1", "2020.2", "2021.1", "2021.2"] if version is None else [version, None]
+    last_exc: Exception | None = None
     for ver in versions_to_try:
         try:
-            return Hfss(
+            kwargs = dict(
                 project=str(project_file),
                 design=DESIGN_NAME,
-                version=ver,
                 non_graphical=non_graphical,
             )
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"version={ver}: {exc}")
+            if ver is not None:
+                kwargs["version"] = ver
+            hfss = Hfss(**kwargs)
+            logging.info("HFSS 会话创建成功，版本: %s", ver or "自动")
+            return hfss
+        except Exception as e:  # noqa: BLE001
+            logging.warning("版本 %s 尝试失败: %s", ver, e)
+            last_exc = e
             time.sleep(2)
 
-    raise RuntimeError("无法初始化 Hfss 会话。 " + " | ".join(errors))
+    raise RuntimeError(f"所有版本均无法初始化 Hfss 会话: {last_exc}") from last_exc
 
 
 def _safe_save(hfss: Any) -> None:
@@ -502,11 +513,12 @@ def _safe_save(hfss: Any) -> None:
 
 
 def _safe_release(hfss: Any) -> None:
+    if hfss is None:
+        return
     try:
-        if hfss is not None and hasattr(hfss, "release_desktop"):
-            hfss.release_desktop()
+        hfss.release_desktop()
     except Exception as e:  # noqa: BLE001
-        logging.warning("release_desktop 失败: %s", e)
+        logging.warning("release_desktop 失败（忽略）: %s", e)
 
 
 def _cleanup_hfss_session(hfss: Any, sleep_sec: int = 2) -> None:
@@ -768,6 +780,7 @@ def _is_almost_same_params(
 def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> tuple[dict[str, Any], Hfss]:
     """在已打开的 HFSS 会话中评估一次设计。"""
     # 只写入优化参数，不覆盖 HFSS 工程内的固定参数
+    failed_vars = []
     vars_i = asdict(design_vars)
     design_vars_opt = {k: v for k, v in vars_i.items() if k in OPT_PARAM_NAMES}
     try:
@@ -777,7 +790,7 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
         _safe_save(hfss)
         _safe_release(hfss)
         time.sleep(3)
-        hfss = _create_hfss_session(Path(project_path), non_graphical=True, version="2020.2")
+        hfss = _create_hfss_session(Path(project_path), non_graphical=True)
         try:
             _apply_design_variables(hfss, design_vars_opt)
         except Exception as exc2:  # noqa: BLE001
@@ -917,7 +930,7 @@ def run_optimization(
     if not project_file.exists():
         raise FileNotFoundError(f"HFSS 工程不存在: {project_file}")
 
-    hfss = _create_hfss_session(project_file, non_graphical=True, version="2020.2")
+    hfss = _create_hfss_session(project_file, non_graphical=True)
 
     max_valid_loss: float | None = None
     try:
@@ -944,7 +957,7 @@ def run_optimization(
                     logging.info("第 %d 轮，主动刷新HFSS会话...", i)
                     _cleanup_hfss_session(hfss, sleep_sec=1)
                     time.sleep(3)
-                    hfss = _create_hfss_session(project_file, non_graphical=True, version="2020.2")
+                    hfss = _create_hfss_session(project_file, non_graphical=True)
                     logging.info("HFSS会话已刷新，新PID已建立")
 
                 cand_raw = optimizer.suggest(1)[0]
