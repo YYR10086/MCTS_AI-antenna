@@ -381,6 +381,9 @@ def _apply_design_variables(hfss, design_vars: dict) -> None:
         if not success:
             raise RuntimeError(f"变量 '{name}' 三种方式均写入失败，终止本轮仿真")
 
+    if failed_vars:
+        raise RuntimeError(f"设计变量写入失败: {', '.join(failed_vars)}")
+
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
     stem = project_file.stem
