@@ -396,7 +396,7 @@ def _apply_design_variables(hfss, design_vars: dict):
         # 方式1a：旧版 PyAEDT COM 接口（odesign，无下划线）
         if not success:
             try:
-                hfss.odesign.ChangeProperty(
+                hfss._odesign.ChangeProperty(
                     [
                         "NAME:AllTabs",
                         [
