@@ -63,21 +63,40 @@ SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
 BUDGET = 100  # 服务器上一次跑100轮
 
 API_CONFIG = {
-    "Rc": {"type": "real", "space": "linear", "range": (6.0, 7.2)},
-    "S": {"type": "real", "space": "linear", "range": (0.8, 1.4)},
-    "dp": {"type": "real", "space": "linear", "range": (0.3, 0.65)},
-    "x1": {"type": "real", "space": "linear", "range": (1.3, 2.2)},
-    "y1": {"type": "real", "space": "linear", "range": (1.3, 2.0)},
+    "W": {"type": "real", "space": "linear", "range": (12.0, 20.0)},
+    "Lx": {"type": "real", "space": "linear", "range": (8.0, 10.0)},
+    "Ly": {"type": "real", "space": "linear", "range": (0.5, 2.0)},
+    "dy": {"type": "real", "space": "linear", "range": (0.5, 4.0)},
+    "Rc": {"type": "real", "space": "linear", "range": (5.0, 7.0)},
+    "dc": {"type": "real", "space": "linear", "range": (0.5, 1.3)},
+    "S": {"type": "real", "space": "linear", "range": (1.0, 1.5)},
+    "d": {"type": "real", "space": "linear", "range": (0.5, 1.0)},
+    "Sw": {"type": "real", "space": "linear", "range": (0.1, 1.0)},
+    "dp": {"type": "real", "space": "linear", "range": (0.1, 1.0)},
+    "Sl": {"type": "real", "space": "linear", "range": (1.0, 5.0)},
+    "x1": {"type": "real", "space": "linear", "range": (1.0, 5.0)},
+    "y1": {"type": "real", "space": "linear", "range": (0.0, 3.0)},
+    "y2": {"type": "real", "space": "linear", "range": (0.0, 3.0)},
 }
-OPT_PARAM_NAMES = ["Rc", "S", "dp", "x1", "y1"]  # 仅优化这 5 个参数
-
-PARAM_SAFE_LB = {
-    "dp": 0.3,
-    "x1": 1.3,
-    "y1": 1.3,
-    "S": 0.8,
-    "Rc": 6.0,
-}
+OPT_PARAM_NAMES = [
+    "W",
+    "Lx",
+    "Ly",
+    "dy",
+    "Rc",
+    "dc",
+    "S",
+    "d",
+    "Sw",
+    "dp",
+    "Sl",
+    "x1",
+    "y1",
+    "y2",
+]
+# 以下两个变量固定不优化，不写入此列表：
+# h  = 0.787mm（基板厚度，固定）
+# xx = 0mm（固定为0）
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
@@ -305,23 +324,17 @@ def build_optimizer(api_config: dict[str, dict[str, Any]]):
         return FallbackRandomOptimizer(api_config)
 
 
-def validate_params(params: dict[str, float], api_config: dict[str, dict[str, Any]]) -> dict[str, float]:
-    """参数越界时自动裁剪到合法范围，并记录 warning。"""
-    fixed: dict[str, float] = {}
-    for k, v in params.items():
-        if k not in api_config:
-            fixed[k] = float(v)
-            continue
-        lb, ub = api_config[k]["range"]
-        clipped = float(np.clip(float(v), lb, ub))
-        if clipped != float(v):
-            logging.warning("参数 %s 越界: %.6f -> clip 到 %.6f (范围 %.6f~%.6f)", k, float(v), clipped, lb, ub)
-        fixed[k] = clipped
-
-    for k, safe_lb in PARAM_SAFE_LB.items():
-        if k in fixed and fixed[k] < safe_lb:
-            logging.warning("参数 %s 值 %.4f 低于安全下界 %.4f，强制提升", k, fixed[k], safe_lb)
-            fixed[k] = float(safe_lb)
+def validate_params(params: dict) -> dict:
+    """参数越界时自动裁剪到 API_CONFIG 合法范围，并记录 warning。"""
+    fixed = dict(params)
+    for k, cfg in API_CONFIG.items():
+        if k in fixed:
+            lb, ub = cfg["range"]
+            val = float(fixed[k])
+            clipped = float(np.clip(val, lb, ub))
+            if abs(clipped - val) > 1e-9:
+                logging.warning("参数 %s=%.4f 超界，clip到 [%.4f, %.4f]", k, val, lb, ub)
+            fixed[k] = clipped
     return fixed
 
 
@@ -758,8 +771,8 @@ def _is_almost_same_params(
 def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> tuple[dict[str, Any], Hfss]:
     """在已打开的 HFSS 会话中评估一次设计。"""
     # 只写入优化参数，不覆盖 HFSS 工程内的固定参数
-    design_vars_all = asdict(design_vars)
-    design_vars_opt = {k: float(v) for k, v in design_vars_all.items() if k in OPT_PARAM_NAMES}
+    vars_i = asdict(design_vars)
+    design_vars_opt = {k: v for k, v in vars_i.items() if k in OPT_PARAM_NAMES}
     try:
         _apply_design_variables(hfss, design_vars_opt)
     except Exception as exc:  # noqa: BLE001
@@ -785,7 +798,7 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
                 "sweep_name": SWEEP_NAME,
                 "far_field_sphere": FAR_FIELD_SPHERE,
                 "project_path": project_path,
-                "design_vars": design_vars_all,
+                "design_vars": vars_i,
                 "s11_curve": {"freq_ghz": [], "s11_db": []},
                 "gain_28ghz_db": float("nan"),
                 "gain_38ghz_db": float("nan"),
@@ -836,7 +849,7 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
         "sweep_name": SWEEP_NAME,
         "far_field_sphere": FAR_FIELD_SPHERE,
         "project_path": project_path,
-        "design_vars": asdict(design_vars),
+        "design_vars": vars_i,
         "s11_curve": {
             "freq_ghz": freqs.tolist(),
             "s11_db": s11_db.tolist(),
@@ -948,7 +961,7 @@ def run_optimization(
                     logging.info("HFSS会话已刷新，新PID已建立")
 
                 cand_raw = optimizer.suggest(1)[0]
-                cand = validate_params(cand_raw, API_CONFIG)
+                cand = validate_params(cand_raw)
                 vars_i = DesignVariables(**{**asdict(default_vars), **cand})
 
                 err_msg = ""
