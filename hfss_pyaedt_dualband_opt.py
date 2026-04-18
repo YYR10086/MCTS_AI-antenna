@@ -390,32 +390,7 @@ def _apply_design_variables(hfss, design_vars: dict):
         # 方式C：hfss[name] 下标赋值
         if not success:
             try:
-                odesign = (
-                    hfss._odesign
-                    if hasattr(hfss, "_odesign") and hfss._odesign is not None
-                    else hfss.odesign
-                    if hasattr(hfss, "odesign")
-                    else None
-                )
-                if odesign is not None:
-                    odesign.SetVariableValue(name, expr)
-                    success = True
-            except Exception as e:
-                logging.warning("方式0b写入 %s 失败: %s", name, e)
-
-        # 方式1a：旧版 PyAEDT COM 接口（odesign，无下划线）
-        if not success:
-            try:
-                hfss._odesign.ChangeProperty(
-                    [
-                        "NAME:AllTabs",
-                        [
-                            "NAME:LocalVariableTab",
-                            ["NAME:PropServers", "LocalVariables"],
-                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
-                        ],
-                    ]
-                )
+                hfss[name] = expr
                 success = True
                 logging.debug("方式C成功写入 %s=%s", name, expr)
             except Exception as e:
@@ -830,50 +805,74 @@ def _is_almost_same_params(
 def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_path: str) -> tuple[dict[str, Any], Hfss]:
     """在已打开的 HFSS 会话中评估一次设计。"""
     # 只写入优化参数，不覆盖 HFSS 工程内的固定参数
-    failed_vars = []
     vars_i = asdict(design_vars)
     design_vars_opt = {k: v for k, v in vars_i.items() if k in OPT_PARAM_NAMES}
+    fail_result = {
+        "gain_28ghz_db": float("nan"),
+        "gain_38ghz_db": float("nan"),
+        "loss": 500.0,
+        "dualband_match_ok": False,
+    }
+
+    # 步骤1：写入变量
     try:
+        logging.info("[EVAL] 步骤1：开始写入设计变量，参数=%s", list(design_vars_opt.keys()))
         _apply_design_variables(hfss, design_vars_opt)
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("写入设计变量失败，跳过本轮仿真")
-        return {
-            "gain_28ghz_db": float("nan"),
-            "gain_38ghz_db": float("nan"),
-            "loss": 500.0,
-            "dualband_match_ok": False,
-        }, hfss
-    _safe_save(hfss)
-    time.sleep(1)
+        logging.info("[EVAL] 步骤1：完成")
+    except Exception as e:  # noqa: BLE001
+        logging.error("[EVAL] 步骤1失败: %s", e, exc_info=True)
+        return fail_result, hfss
+
+    # 步骤2：保存工程
     try:
-        hfss.delete_solution_data()
-    except Exception:
-        pass
+        logging.info("[EVAL] 步骤2：save_project")
+        hfss.save_project()
+        logging.info("[EVAL] 步骤2：完成")
+    except Exception as e:  # noqa: BLE001
+        logging.warning("[EVAL] 步骤2失败（忽略）: %s", e)
+
+    # 步骤3：运行仿真
     try:
-        hfss.odesign.DeleteFullVariation("All", False)
-    except Exception:
-        pass
-    if not _check_geometry_valid(hfss):
-        raise RuntimeError("几何模型无效，跳过本轮仿真")
-    if STOP_REQUESTED:
-        raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
-    with AnalyzeHeartbeat(tag=f"HFSS analyze_setup({SETUP_NAME})", interval_sec=30):
+        try:
+            hfss.delete_solution_data()
+        except Exception:
+            pass
+        try:
+            hfss.odesign.DeleteFullVariation("All", False)
+        except Exception:
+            pass
+        if not _check_geometry_valid(hfss):
+            raise RuntimeError("几何模型无效，跳过本轮仿真")
+        if STOP_REQUESTED:
+            raise KeyboardInterrupt("检测到用户中断请求，停止 analyze_setup。")
+        logging.info("[EVAL] 步骤3：analyze_setup 开始")
         _run_analyze_with_interrupt(hfss, SETUP_NAME)
-    if STOP_REQUESTED:
-        raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
+        logging.info("[EVAL] 步骤3：完成")
+    except Exception as e:  # noqa: BLE001
+        logging.error("[EVAL] 步骤3失败: %s", e, exc_info=True)
+        return fail_result, hfss
 
-    freqs, s11_db = _get_s11_curve(hfss)
-    band1_ok = _band_ok(freqs, s11_db, BAND_1, S11_THRESHOLD_DB)
-    band2_ok = _band_ok(freqs, s11_db, BAND_2, S11_THRESHOLD_DB)
+    # 步骤4：提取结果
+    try:
+        logging.info("[EVAL] 步骤4：提取增益和S11")
+        if STOP_REQUESTED:
+            raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
+        freqs, s11_db = _get_s11_curve(hfss)
+        band1_ok = _band_ok(freqs, s11_db, BAND_1, S11_THRESHOLD_DB)
+        band2_ok = _band_ok(freqs, s11_db, BAND_2, S11_THRESHOLD_DB)
 
-    gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0])
-    gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1])
-    if gain_28 > GAIN_PHYSICAL_MAX or gain_28 < -60.0:
-        logging.warning("gain_28=%.2f 超出物理范围，置为 nan", gain_28)
-        gain_28 = float("nan")
-    if gain_38 > GAIN_PHYSICAL_MAX or gain_38 < -60.0:
-        logging.warning("gain_38=%.2f 超出物理范围，置为 nan", gain_38)
-        gain_38 = float("nan")
+        gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0])
+        gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1])
+        if gain_28 > GAIN_PHYSICAL_MAX or gain_28 < -60.0:
+            logging.warning("gain_28=%.2f 超出物理范围，置为 nan", gain_28)
+            gain_28 = float("nan")
+        if gain_38 > GAIN_PHYSICAL_MAX or gain_38 < -60.0:
+            logging.warning("gain_38=%.2f 超出物理范围，置为 nan", gain_38)
+            gain_38 = float("nan")
+        logging.info("[EVAL] 步骤4：完成")
+    except Exception as e:  # noqa: BLE001
+        logging.error("[EVAL] 步骤4失败: %s", e, exc_info=True)
+        return fail_result, hfss
 
     return {
         "project_name": PROJECT_NAME,
