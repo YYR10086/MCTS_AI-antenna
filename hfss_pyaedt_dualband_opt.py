@@ -338,60 +338,63 @@ def validate_params(params: dict) -> dict:
     return fixed
 
 
-def _apply_design_variables(hfss, design_vars: dict) -> None:
+def _apply_design_variables(hfss, design_vars: dict):
     for name, value in design_vars.items():
         expr = f"{float(value):.6f}mm"
         success = False
 
-        change_payload = [
-            "NAME:AllTabs",
-            [
-                "NAME:LocalVariableTab",
-                ["NAME:PropServers", "LocalVariables"],
-                [
-                    "NAME:ChangedProps",
-                    ["NAME:" + name, "Value:=", expr],
-                ],
-            ],
-        ]
-
-        # 方式1a：新版 PyAEDT（_odesign，gRPC）
-        try:
-            hfss._odesign.ChangeProperty(change_payload)
-            success = True
-        except AttributeError:
-            pass
-        except Exception as e1a:  # noqa: BLE001
-            logging.warning("方式1a失败: %s", e1a)
-
-        # 方式1b：旧版 PyAEDT（odesign，COM）
+        # 方式1a：旧版 PyAEDT COM 接口（odesign，无下划线）
         if not success:
             try:
-                hfss.odesign.ChangeProperty(change_payload)
+                hfss.odesign.ChangeProperty(
+                    [
+                        "NAME:AllTabs",
+                        [
+                            "NAME:LocalVariableTab",
+                            ["NAME:PropServers", "LocalVariables"],
+                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                        ],
+                    ]
+                )
                 success = True
-            except AttributeError:
-                pass
-            except Exception as e1b:  # noqa: BLE001
-                logging.warning("方式1b失败: %s", e1b)
+            except Exception as e:
+                logging.warning("方式1a写入 %s 失败: %s", name, e)
+
+        # 方式1b：新版 PyAEDT gRPC 接口（_odesign，有下划线）
+        if not success:
+            try:
+                hfss._odesign.ChangeProperty(
+                    [
+                        "NAME:AllTabs",
+                        [
+                            "NAME:LocalVariableTab",
+                            ["NAME:PropServers", "LocalVariables"],
+                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                        ],
+                    ]
+                )
+                success = True
+            except Exception as e:
+                logging.warning("方式1b写入 %s 失败: %s", name, e)
 
         # 方式2：variable_manager 字典接口
         if not success:
             try:
                 hfss.variable_manager[name] = expr
                 success = True
-            except Exception as e2:  # noqa: BLE001
-                logging.warning("方式2写入 %s 失败: %s", name, e2)
+            except Exception as e:
+                logging.warning("方式2写入 %s 失败: %s", name, e)
 
         # 方式3：hfss[] 下标接口
         if not success:
             try:
                 hfss[name] = expr
                 success = True
-            except Exception as e3:  # noqa: BLE001
-                logging.warning("方式3写入 %s 失败: %s", name, e3)
+            except Exception as e:
+                logging.warning("方式3写入 %s 失败: %s", name, e)
 
         if not success:
-            raise RuntimeError(f"变量 '{name}' 三种方式均写入失败，终止本轮仿真")
+            raise RuntimeError(f"变量 '{name}' 四种方式均写入失败")
 
 
 def _possible_lock_files(project_file: Path) -> list[Path]:
@@ -468,22 +471,21 @@ def _attach_existing_hfss(project_file: Path, non_graphical: bool, version: str)
     raise RuntimeError("附着已打开 HFSS 会话失败: " + " | ".join(attach_errors))
 
 
-def _create_hfss_session(project_file: Path, non_graphical: bool = True, version: str | None = None):
-    project_file = Path(project_file).resolve()
-    if not project_file.exists():
-        raise FileNotFoundError(f"HFSS 工程文件不存在: {project_file}")
-
-    lock_file = str(project_file) + ".lock"
-    if os.path.exists(lock_file):
+def _create_hfss_session(project_file, non_graphical=True, version=None):
+    lock_file = Path(str(project_file) + ".lock")
+    if lock_file.exists():
         try:
-            os.remove(lock_file)
-            print(f"[LOCK] 已删除锁文件: {lock_file}")
+            lock_file.unlink()
+            logging.info("[LOCK] 已删除锁文件: %s", lock_file)
             time.sleep(2)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[LOCK] 删除锁文件失败: {exc}")
+        except Exception as e:
+            logging.warning("[LOCK] 删除锁文件失败: %s", e)
 
-    versions_to_try = ["2020.1", "2020.2", "2021.1", "2021.2"] if version is None else [version, None]
-    last_exc: Exception | None = None
+    versions_to_try = ["2020.1", "2021.1", "2021.2", "2022.1", None]
+    if version is not None:
+        versions_to_try = [version] + [v for v in versions_to_try if v != version]
+
+    last_exc = None
     for ver in versions_to_try:
         try:
             kwargs = dict(
@@ -494,9 +496,9 @@ def _create_hfss_session(project_file: Path, non_graphical: bool = True, version
             if ver is not None:
                 kwargs["version"] = ver
             hfss = Hfss(**kwargs)
-            logging.info("HFSS 会话创建成功，版本: %s", ver or "自动")
+            logging.info("HFSS 会话创建成功，版本: %s", ver or "自动检测")
             return hfss
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logging.warning("版本 %s 尝试失败: %s", ver, e)
             last_exc = e
             time.sleep(2)
@@ -512,12 +514,12 @@ def _safe_save(hfss: Any) -> None:
         logging.warning("save_project 失败: %s", e)
 
 
-def _safe_release(hfss: Any) -> None:
+def _safe_release(hfss):
     if hfss is None:
         return
     try:
         hfss.release_desktop()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logging.warning("release_desktop 失败（忽略）: %s", e)
 
 
