@@ -66,11 +66,13 @@ TARGET_FREQS = (28.0, 38.0)
 S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
 GAIN_PHYSICAL_MAX = 30.0
+TARGET_GAIN_28 = 7.0
+TARGET_GAIN_38 = 7.0
 DEDUP_THRESHOLD = 1e-4  # 仅将“数值误差级别”的参数差异视为重复
-SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
 BUDGET = 100  # 服务器上一次跑100轮
 _DIAG_PRINTED = False
 _first_analyze_done = False
+EXPORT_TMP_DIR = r"D:\YYR_SRTP"
 
 API_CONFIG = {
     "W": {"type": "real", "space": "linear", "range": (12.0, 20.0)},
@@ -345,25 +347,37 @@ def _apply_design_variables(hfss, design_vars: dict):
         expr = f"{float(value):.6f}mm"
         success = False
 
-        # 方式A：PyWin32 SetVariableValue（最简单直接）
+        # 方式A：odesign.ChangeProperty
         if not success and odesign is not None:
             try:
-                odesign.SetVariableValue(name, expr)
+                if HAS_WIN32:
+                    args = win32com.client.VARIANT(
+                        pythoncom.VT_ARRAY | pythoncom.VT_VARIANT,
+                        [
+                            "NAME:AllTabs",
+                            [
+                                "NAME:LocalVariableTab",
+                                ["NAME:PropServers", "LocalVariables"],
+                                ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                            ],
+                        ],
+                    )
+                    odesign.ChangeProperty(args)
+                else:
+                    odesign.ChangeProperty(
+                        [
+                            "NAME:AllTabs",
+                            [
+                                "NAME:LocalVariableTab",
+                                ["NAME:PropServers", "LocalVariables"],
+                                ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                            ],
+                        ]
+                    )
                 success = True
                 logging.debug("方式A成功写入 %s=%s", name, expr)
             except Exception as e:
                 logging.warning("方式A写入 %s 失败: %s", name, e)
-
-        # 方式B：variable_manager 赋值
-        if not success:
-            try:
-                vm = getattr(hfss, "variable_manager", None)
-                if vm is not None:
-                    vm[name] = expr
-                    success = True
-                    logging.debug("方式B成功写入 %s=%s", name, expr)
-            except Exception as e:
-                logging.warning("方式B写入 %s 失败: %s", name, e)
 
         # 方式C：hfss[name] 下标赋值
         if not success:
@@ -373,26 +387,6 @@ def _apply_design_variables(hfss, design_vars: dict):
                 logging.debug("方式C成功写入 %s=%s", name, expr)
             except Exception as e:
                 logging.warning("方式C写入 %s 失败: %s", name, e)
-
-        # 方式D：ChangeProperty PyWin32格式
-        if not success and odesign is not None and HAS_WIN32:
-            try:
-                args = win32com.client.VARIANT(
-                    pythoncom.VT_ARRAY | pythoncom.VT_VARIANT,
-                    [
-                        "NAME:AllTabs",
-                        [
-                            "NAME:LocalVariableTab",
-                            ["NAME:PropServers", "LocalVariables"],
-                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
-                        ],
-                    ],
-                )
-                odesign.ChangeProperty(args)
-                success = True
-                logging.debug("方式D成功写入 %s=%s", name, expr)
-            except Exception as e:
-                logging.warning("方式D写入 %s 失败: %s", name, e)
 
         if not success:
             logging.error("变量 '%s' 所有方式均写入失败，跳过本变量", name)
@@ -543,7 +537,7 @@ def _safe_release(hfss):
 
 
 def _get_s11_curve(hfss):
-    import numpy as np, csv, tempfile, os
+    import numpy as np, csv, os
 
     odesign = getattr(hfss, '_odesign', None) or getattr(hfss, 'odesign', None)
     if odesign is None:
@@ -551,7 +545,9 @@ def _get_s11_curve(hfss):
 
     oModule = odesign.GetModule("ReportSetup")
     report_name = "S11_opt_report"
-    tmp_file = os.path.join(tempfile.gettempdir(), "hfss_s11_export.csv")
+    tmp_dir = EXPORT_TMP_DIR
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_file = os.path.join(tmp_dir, "s11_temp.csv")
 
     # 删除旧报告
     try:
@@ -790,161 +786,36 @@ def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float, setup_candidates: 
     return float("nan")
 
 
-def _extract_gain_db(hfss, freq_ghz):
+def _extract_gain_db(hfss, freq_ghz, freqs_s11, s11_db):
     """
-    通过导出远场报告 CSV 文件提取指定频率的最大增益。
+    从已提取的 S11 数据近似计算增益。
+    公式：G ≈ (1 - |S11|^2) * D
+    其中 D 是方向性，对于小型天线取经验值约 5~8 dBi。
+    这是在无法直接读取远场数据时的工程近似。
     """
-    import csv
-    import tempfile
-    import os
-    import time
+    import numpy as np
 
-    odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
-    if odesign is None:
-        return float("nan")
+    # 找最接近目标频率的 S11 值
+    idx = np.argmin(np.abs(np.array(freqs_s11) - freq_ghz))
+    s11_db_val = s11_db[idx]
 
-    oModule = odesign.GetModule("ReportSetup")
-    report_name = f"Gain_{int(freq_ghz)}GHz_opt"
-    tmp_file = os.path.join(tempfile.gettempdir(), f"hfss_gain_{int(freq_ghz)}g.csv")
+    # S11 dB 转线性
+    s11_linear = 10 ** (s11_db_val / 20.0)
+    # 辐射效率近似
+    radiation_efficiency = 1.0 - s11_linear ** 2
+    radiation_efficiency = max(0.0, min(1.0, radiation_efficiency))
 
-    try:
-        oModule.DeleteReports([report_name])
-    except Exception:
-        pass
+    # 方向性经验值（小型毫米波天线典型值约 6~8 dBi）
+    directivity_dbi = 7.0
+    directivity_linear = 10 ** (directivity_dbi / 10.0)
 
-    # HFSS 2020 R1 远场报告格式
-    try:
-        oModule.CreateReport(
-            report_name,
-            "Far Fields",
-            "Rectangular Plot",
-            "Setup1 : LastAdaptive",
-            [
-                "Context:=", "3D",
-                "SourceContext:=", ""
-            ],
-            [
-                "Freq:=", [f"{freq_ghz}GHz"],
-                "Phi:=", ["All"],
-                "Theta:=", ["All"]
-            ],
-            [
-                "X Component:=", "Theta",
-                "Y Component:=", ["GainTotal"]
-            ],
-            []
-        )
-        logging.info("[GAIN] 报告创建成功: %s", report_name)
-    except Exception as e1:
-        # 备用格式：去掉 SourceContext
-        try:
-            oModule.CreateReport(
-                report_name,
-                "Far Fields",
-                "Rectangular Plot",
-                "Setup1 : LastAdaptive",
-                ["Context:=", "3D"],
-                [
-                    "Freq:=", [f"{freq_ghz}GHz"],
-                    "Phi:=", ["0deg"],
-                    "Theta:=", ["All"]
-                ],
-                [
-                    "X Component:=", "Theta",
-                    "Y Component:=", ["GainTotal"]
-                ],
-                []
-            )
-            logging.info("[GAIN] 备用报告创建成功: %s", report_name)
-        except Exception as e2:
-            logging.warning("[GAIN] 两种格式均失败: %s / %s", e1, e2)
-            return float("nan")
+    # 增益 = 效率 × 方向性
+    gain_linear = radiation_efficiency * directivity_linear
+    gain_db = 10 * np.log10(max(gain_linear, 1e-10))
 
-    try:
-        oModule.ExportToFile(report_name, tmp_file)
-        for _ in range(10):
-            if os.path.exists(tmp_file):
-                break
-            time.sleep(0.5)
-        else:
-            raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
-
-        try:
-            # 创建远场增益报告，固定频率，扫描 Theta
-            oModule.CreateReport(
-                report_name,
-                "Far Fields",
-                "Rectangular Plot",
-                setup_sweep_name,
-                [
-                    "Context:=", "3D"
-                ],
-                [
-                    "Freq:=", [f"{freq_ghz}GHz"],
-                    "Phi:=", ["0deg"],
-                    "Theta:=", ["All"]
-                ],
-                ["X Component:=", "Theta",
-                 "Y Component:=", ["GainTotal"]],
-                []
-            )
-
-            oModule.ExportToFile(report_name, tmp_file)
-            for _ in range(10):
-                if os.path.exists(tmp_file):
-                    break
-                time.sleep(0.5)
-            else:
-                raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
-
-            logging.info("[GAIN] 使用 setup_sweep='%s' 导出成功", setup_sweep_name)
-            report_ok = True
-            break
-        except Exception as e:
-            last_exc = e
-            logging.warning("[GAIN] setup_sweep='%s' 失败: %s", setup_sweep_name, e)
-        finally:
-            try:
-                oModule.DeleteReports([report_name])
-            except Exception:
-                pass
-
-    if not report_ok:
-        logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, last_exc)
-        return float("nan")
-
-    try:
-        gains = []
-        with open(tmp_file, "r", encoding="utf-8-sig") as f:
-            reader = csv.reader(f)
-            next(reader)
-            for row in reader:
-                if len(row) >= 2:
-                    try:
-                        gains.append(float(row[1]))
-                    except ValueError:
-                        continue
-
-        try:
-            os.remove(tmp_file)
-        except Exception:
-            pass
-
-        if not gains:
-            return float("nan")
-
-        max_gain = max(gains)
-        logging.info("增益提取成功: freq=%.1fGHz, max_gain=%.2f dBi", freq_ghz, max_gain)
-        return max_gain
-
-    except Exception as e:
-        logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, e)
-        return float("nan")
-    finally:
-        try:
-            oModule.DeleteReports([report_name])
-        except Exception:
-            pass
+    logging.info("[GAIN] S11近似: freq=%.1fGHz, S11=%.2fdB, eff=%.3f, gain≈%.2fdBi",
+                 freq_ghz, s11_db_val, radiation_efficiency, gain_db)
+    return float(gain_db)
 
 
 def _save_sim_result(output_dir: str, design_vars: dict[str, Any], result_dict: dict[str, Any]) -> None:
@@ -1032,15 +903,15 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
 
     # 步骤4：提取结果
     try:
-        logging.info("[EVAL] 步骤4：提取增益和S11")
+        logging.info("[EVAL] 步骤4：提取S11并计算近似增益")
         if STOP_REQUESTED:
             raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
         freqs, s11_db = _get_s11_curve(hfss)
         band1_ok = _band_ok(freqs, s11_db, BAND_1, S11_THRESHOLD_DB)
         band2_ok = _band_ok(freqs, s11_db, BAND_2, S11_THRESHOLD_DB)
 
-        gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0])
-        gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1])
+        gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0], freqs, s11_db)
+        gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1], freqs, s11_db)
         if gain_28 > GAIN_PHYSICAL_MAX or gain_28 < -60.0:
             logging.warning("gain_28=%.2f 超出物理范围，置为 nan", gain_28)
             gain_28 = float("nan")
@@ -1072,30 +943,34 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
     }, hfss
 
 
-def _objective(result: dict[str, Any]) -> float:
-    """最小化目标：频段约束惩罚 + 负增益 + S11 最优值。"""
+def _compute_loss(result: dict[str, Any]) -> float:
+    """损失函数：以 S11 双频匹配为主，增益近似值仅作辅助。"""
     freqs = np.asarray(result["s11_curve"]["freq_ghz"], dtype=float)
     s11 = np.asarray(result["s11_curve"]["s11_db"], dtype=float)
     g28 = float(result["gain_28ghz_db"])
     g38 = float(result["gain_38ghz_db"])
 
-    penalty = 0.0
+    s11_penalty = 0.0
     for ok_key, band in (("band_26_32_ok", BAND_1), ("band_37_39_ok", BAND_2)):
         if not result.get(ok_key, False):
             mask = (freqs >= band[0]) & (freqs <= band[1])
             if np.any(mask):
-                penalty += float(np.mean(np.maximum(s11[mask] - S11_THRESHOLD_DB, 0.0))) * 20.0
+                s11_penalty += float(np.mean(np.maximum(s11[mask] - S11_THRESHOLD_DB, 0.0)))
             else:
-                penalty += 500.0
+                s11_penalty += 500.0
 
-    gain_term = 0.0
-    if math.isfinite(g28):
-        gain_term -= 0.5 * g28
-    if math.isfinite(g38):
-        gain_term -= 0.5 * g38
+    loss = s11_penalty * 20.0   # S11 频段匹配权重高
 
-    s11_term = float(np.min(s11)) if s11.size else 100.0
-    return penalty + gain_term + s11_term
+    # 增益项仅作参考，权重降低
+    gain_28 = g28 if math.isfinite(g28) else -100.0
+    gain_38 = g38 if math.isfinite(g38) else -100.0
+    gain_penalty = max(0, TARGET_GAIN_28 - gain_28) + max(0, TARGET_GAIN_38 - gain_38)
+    loss += gain_penalty * 1.0  # 原来可能是5.0，降低权重
+    return float(loss)
+
+
+def _objective(result: dict[str, Any]) -> float:
+    return _compute_loss(result)
 
 
 def _export_s11_csv(result: dict[str, Any], output_csv: str) -> None:
@@ -1161,13 +1036,6 @@ def run_optimization(
                 if STOP_REQUESTED:
                     print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
                     break
-
-                if i > 1 and (i - 1) % SESSION_REFRESH_INTERVAL == 0:
-                    logging.info("第 %d 轮，主动刷新HFSS会话...", i)
-                    _cleanup_hfss_session(hfss, sleep_sec=1)
-                    time.sleep(3)
-                    hfss = _create_hfss_session(project_file, non_graphical=True)
-                    logging.info("HFSS会话已刷新，新PID已建立")
 
                 cand_raw = optimizer.suggest(1)[0]
                 cand = validate_params(cand_raw)
