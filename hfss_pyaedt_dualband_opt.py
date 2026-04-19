@@ -819,68 +819,64 @@ def _extract_gain_db(hfss, freq_ghz):
     except Exception as e:
         logging.warning("[GAIN] 无法获取报告类型: %s", e)
 
-    # 尝试创建 Antenna Parameters 类型报告（HFSS 2020 专用）
-    created = False
-    for report_type in ["Antenna Parameters", "Far Fields"]:
-        if created:
-            break
-        for context in [["Context:=", "3D"], []]:
-            try:
-                oModule.CreateReport(
-                    report_name,
-                    report_type,
-                    "Rectangular Plot",
-                    "Setup1 : LastAdaptive",
-                    context,
-                    [
-                        "Freq:=", [f"{freq_ghz}GHz"],
-                        "Phi:=", ["0deg"],
-                        "Theta:=", ["All"]
-                    ],
-                    [
-                        "X Component:=", "Theta",
-                        "Y Component:=", ["GainTotal"]
-                    ],
-                    []
-                )
-                created = True
-                logging.info("[GAIN] 报告创建成功: type=%s", report_type)
-                break
-            except Exception as e:
-                logging.warning("[GAIN] type=%s context=%s 失败: %s",
-                               report_type, context, e)
-
-    if not created:
-        logging.warning("[GAIN] 所有格式均无法创建报告")
-        return float("nan")
-
-    # 导出文件
     try:
-        oModule.ExportToFile(report_name, tmp_file)
+        quantities = oModule.GetAvailableQuantities("Antenna Parameters",
+                                                     "Rectangular Plot",
+                                                     "3D",
+                                                     "Setup1 : LastAdaptive")
+        logging.info("[GAIN] Antenna Parameters 可用变量: %s", list(quantities))
     except Exception as e:
-        logging.warning("[GAIN] ExportToFile 失败: %s", e)
-        try:
-            oModule.DeleteReports([report_name])
-        except Exception:
-            pass
-        return float("nan")
+        logging.warning("[GAIN] 无法查询变量: %s", e)
 
-    # 等待文件（最多5秒，不要等太长）
-    for _ in range(10):
-        if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
-            break
-        time.sleep(0.5)
-    else:
-        logging.warning("[GAIN] 文件未生成: %s", tmp_file)
-        try:
-            if os.path.exists(tmp_file):
-                os.remove(tmp_file)
-        except Exception:
-            pass
+    try:
+        quantities2 = oModule.GetAvailableQuantities("Far Fields",
+                                                      "Rectangular Plot",
+                                                      "3D",
+                                                      "Setup1 : LastAdaptive")
+        logging.info("[GAIN] Far Fields 可用变量: %s", list(quantities2))
+    except Exception as e:
+        logging.warning("[GAIN] Far Fields 变量查询失败: %s", e)
+    gain_quantities_to_try = [
+        "GainTotal",
+        "dBGainTotal",
+        "Gain",
+        "RealizedGain",
+        "Peak Realized Gain",
+        "Peak Gain",
+    ]
+
+    for qty in gain_quantities_to_try:
         try:
             oModule.DeleteReports([report_name])
         except Exception:
             pass
+        try:
+            oModule.CreateReport(
+                report_name,
+                "Antenna Parameters",
+                "Rectangular Plot",
+                "Setup1 : LastAdaptive",
+                [],
+                [
+                    "Freq:=", [f"{freq_ghz}GHz"],
+                    "Phi:=", ["0deg"],
+                    "Theta:=", ["All"]
+                ],
+                [
+                    "X Component:=", "Theta",
+                    "Y Component:=", [qty]
+                ],
+                []
+            )
+            oModule.ExportToFile(report_name, tmp_file)
+            time.sleep(2)
+            if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
+                logging.info("[GAIN] 成功: qty=%s", qty)
+                break
+            logging.warning("[GAIN] qty=%s 文件未生成", qty)
+        except Exception as e:
+            logging.warning("[GAIN] qty=%s 失败: %s", qty, e)
+    else:
         return float("nan")
 
     # 读取 CSV
