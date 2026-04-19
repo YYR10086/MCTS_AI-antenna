@@ -802,6 +802,7 @@ def _extract_gain_db(hfss, freq_ghz):
     odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
     if odesign is None:
         return float("nan")
+    logging.info("[GAIN] 开始提取增益: %.1f GHz", freq_ghz)
 
     oModule = odesign.GetModule("ReportSetup")
     report_name = f"Gain_{int(freq_ghz)}GHz_opt"
