@@ -869,15 +869,11 @@ def _extract_gain_db(hfss, freq_ghz):
             time.sleep(0.5)
         else:
             raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
-    except Exception as e:
-        logging.warning("增益导出失败 freq=%.1fGHz: %s", freq_ghz, e)
-        return float("nan")
 
-    try:
         gains = []
         with open(tmp_file, "r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
-            next(reader)
+            next(reader, None)
             for row in reader:
                 if len(row) >= 2:
                     try:
@@ -885,22 +881,21 @@ def _extract_gain_db(hfss, freq_ghz):
                     except ValueError:
                         continue
 
-        try:
-            os.remove(tmp_file)
-        except Exception:
-            pass
-
         if not gains:
             return float("nan")
 
         max_gain = max(gains)
         logging.info("增益提取成功: freq=%.1fGHz, max_gain=%.2f dBi", freq_ghz, max_gain)
         return max_gain
-
     except Exception as e:
         logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, e)
         return float("nan")
     finally:
+        try:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        except Exception:
+            pass
         try:
             oModule.DeleteReports([report_name])
         except Exception:
