@@ -870,6 +870,23 @@ def _extract_gain_db(hfss, freq_ghz):
         else:
             raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
 
+            logging.info("[GAIN] 使用 setup_sweep='%s' 导出成功", setup_sweep_name)
+            report_ok = True
+            break
+        except Exception as e:
+            last_exc = e
+            logging.warning("[GAIN] setup_sweep='%s' 失败: %s", setup_sweep_name, e)
+        finally:
+            try:
+                oModule.DeleteReports([report_name])
+            except Exception:
+                pass
+
+    if not report_ok:
+        logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, last_exc)
+        return float("nan")
+
+    try:
         gains = []
         with open(tmp_file, "r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
