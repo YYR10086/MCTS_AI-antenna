@@ -169,6 +169,12 @@ def _run_analyze_with_interrupt(hfss, setup_name):
         odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
         if odesign is not None:
             logging.info("[ANALYZE] 使用 odesign.Analyze('%s')", setup_name)
+            try:
+                odesign.DeleteFullVariation("All", False)
+                logging.info("[ANALYZE] 已清除旧解数据")
+            except Exception as e:
+                logging.warning("[ANALYZE] 清除旧解失败（忽略）: %s", e)
+
             odesign.Analyze(setup_name)
             analyzed = True
             logging.info("[ANALYZE] odesign.Analyze 完成")
@@ -533,50 +539,70 @@ def _safe_release(hfss):
 
 
 def _get_s11_curve(hfss):
-    """
-    通过 HFSS ExportToFile 导出 S11 数据到 CSV，再读取。
-    完全绕过 PyAEDT post 接口，兼容 HFSS 2020 R1 PyWin32 模式。
-    """
-    import numpy as np
-    import csv
-    import tempfile
-    import os
+    import numpy as np, csv, tempfile, os
 
-    odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
+    odesign = getattr(hfss, '_odesign', None) or getattr(hfss, 'odesign', None)
     if odesign is None:
-        raise RuntimeError("无法获取 odesign COM 对象")
+        raise RuntimeError("无法获取 odesign")
 
     oModule = odesign.GetModule("ReportSetup")
-
-    # 创建临时文件路径
+    report_name = "S11_opt_report"
     tmp_file = os.path.join(tempfile.gettempdir(), "hfss_s11_export.csv")
 
-    # 删除旧报告（如果存在）
+    # 删除旧报告
     try:
-        oModule.DeleteReports(["S11_opt_report"])
+        oModule.DeleteReports([report_name])
     except Exception:
         pass
 
-    # 创建 S11 报告
-    oModule.CreateReport(
-        "S11_opt_report",
-        "Modal Solution Data",
-        "Rectangular Plot",
-        "Setup1 : Sweep",
-        ["Domain:=", "Sweep"],
-        ["Freq:=", ["All"]],
-        ["X Component:=", "Freq", "Y Component:=", ["dB(S(Port1,Port1))"]],
-        [],
-    )
-
-    # 导出到 CSV
-    oModule.ExportToFile("S11_opt_report", tmp_file)
-
-    # 删除报告
+    # HFSS 2020 R1 的 CreateReport 格式（不用列表嵌套，用平铺参数）
     try:
-        oModule.DeleteReports(["S11_opt_report"])
-    except Exception:
-        pass
+        oModule.CreateReport(
+            report_name,
+            "Modal Solution Data",
+            "Rectangular Plot",
+            "Setup1 : Sweep",
+            ["Domain:=", "Sweep"],
+            ["Freq:=", ["All"]],
+            ["X Component:=", "Freq",
+             "Y Component:=", ["dB(S(1,1))"]],
+            []
+        )
+        logging.info("[S11] 报告创建成功")
+    except Exception as e:
+        logging.warning("[S11] CreateReport 失败: %s，尝试备用格式", e)
+        # 备用格式：S(Port1,Port1)
+        try:
+            oModule.CreateReport(
+                report_name,
+                "Modal Solution Data",
+                "Rectangular Plot",
+                "Setup1 : Sweep",
+                ["Domain:=", "Sweep"],
+                ["Freq:=", ["All"]],
+                ["X Component:=", "Freq",
+                 "Y Component:=", ["dB(S(Port1,Port1))"]],
+                []
+            )
+            logging.info("[S11] 备用报告创建成功")
+        except Exception as e2:
+            raise RuntimeError(f"CreateReport 所有格式均失败: {e2}") from e2
+
+    # 导出 CSV
+    try:
+        oModule.ExportToFile(report_name, tmp_file)
+        logging.info("[S11] 导出到 %s", tmp_file)
+    except Exception as e:
+        raise RuntimeError(f"ExportToFile 失败: {e}") from e
+    finally:
+        try:
+            oModule.DeleteReports([report_name])
+        except Exception:
+            pass
+
+    # 检查文件是否存在
+    if not os.path.exists(tmp_file):
+        raise RuntimeError(f"导出文件不存在: {tmp_file}")
 
     # 读取 CSV
     freqs, s11_vals = [], []
@@ -590,15 +616,18 @@ def _get_s11_curve(hfss):
                     s11_vals.append(float(row[1]))
                 except ValueError:
                     continue
-
-    os.remove(tmp_file)
+    try:
+        os.remove(tmp_file)
+    except Exception:
+        pass
 
     if not freqs:
-        raise RuntimeError("S11 CSV 文件为空或格式错误")
+        raise RuntimeError("S11 CSV 文件为空")
 
-    freqs = np.array(freqs) / 1e9  # Hz 转 GHz
+    freqs = np.array(freqs) / 1e9
     s11_vals = np.array(s11_vals)
-    logging.info("S11 提取成功，频率点数=%d，范围=%.1f~%.1f GHz", len(freqs), freqs[0], freqs[-1])
+    logging.info("[S11] 提取成功，%d 个频率点，%.1f~%.1f GHz",
+                 len(freqs), freqs[0], freqs[-1])
     return freqs, s11_vals
 
 
@@ -784,21 +813,16 @@ def _extract_gain_db(hfss, freq_ghz):
             "Rectangular Plot",
             "Setup1 : LastAdaptive",
             [
-                "Context:=",
-                "3D",
-                "SourceContext:=",
-                "",
+                "Context:=", "3D"
             ],
             [
-                "Freq:=",
-                [f"{freq_ghz}GHz"],
-                "Phi:=",
-                ["0deg"],
-                "Theta:=",
-                ["All"],
+                "Freq:=", [f"{freq_ghz}GHz"],
+                "Phi:=", ["0deg"],
+                "Theta:=", ["All"]
             ],
-            ["X Component:=", "Theta", "Y Component:=", ["GainTotal"]],
-            [],
+            ["X Component:=", "Theta",
+             "Y Component:=", ["GainTotal"]],
+            []
         )
 
         oModule.ExportToFile(report_name, tmp_file)
