@@ -868,49 +868,8 @@ def _extract_gain_db(hfss, freq_ghz):
             time.sleep(0.5)
         else:
             raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
-
-        try:
-            # 创建远场增益报告，固定频率，扫描 Theta
-            oModule.CreateReport(
-                report_name,
-                "Far Fields",
-                "Rectangular Plot",
-                setup_sweep_name,
-                [
-                    "Context:=", "3D"
-                ],
-                [
-                    "Freq:=", [f"{freq_ghz}GHz"],
-                    "Phi:=", ["0deg"],
-                    "Theta:=", ["All"]
-                ],
-                ["X Component:=", "Theta",
-                 "Y Component:=", ["GainTotal"]],
-                []
-            )
-
-            oModule.ExportToFile(report_name, tmp_file)
-            for _ in range(10):
-                if os.path.exists(tmp_file):
-                    break
-                time.sleep(0.5)
-            else:
-                raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
-
-            logging.info("[GAIN] 使用 setup_sweep='%s' 导出成功", setup_sweep_name)
-            report_ok = True
-            break
-        except Exception as e:
-            last_exc = e
-            logging.warning("[GAIN] setup_sweep='%s' 失败: %s", setup_sweep_name, e)
-        finally:
-            try:
-                oModule.DeleteReports([report_name])
-            except Exception:
-                pass
-
-    if not report_ok:
-        logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, last_exc)
+    except Exception as e:
+        logging.warning("增益导出失败 freq=%.1fGHz: %s", freq_ghz, e)
         return float("nan")
 
     try:
