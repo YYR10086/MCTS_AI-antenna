@@ -69,7 +69,6 @@ GAIN_PHYSICAL_MAX = 30.0
 TARGET_GAIN_28 = 7.0
 TARGET_GAIN_38 = 7.0
 DEDUP_THRESHOLD = 1e-4  # 仅将“数值误差级别”的参数差异视为重复
-SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
 BUDGET = 100  # 服务器上一次跑100轮
 _DIAG_PRINTED = False
 _first_analyze_done = False
@@ -1037,13 +1036,6 @@ def run_optimization(
                 if STOP_REQUESTED:
                     print("[INTERRUPT] 检测到中断请求，提前结束优化循环。")
                     break
-
-                if i > 1 and (i - 1) % SESSION_REFRESH_INTERVAL == 0:
-                    logging.info("第 %d 轮，主动刷新HFSS会话...", i)
-                    _cleanup_hfss_session(hfss, sleep_sec=1)
-                    time.sleep(3)
-                    hfss = _create_hfss_session(project_file, non_graphical=True)
-                    logging.info("HFSS会话已刷新，新PID已建立")
 
                 cand_raw = optimizer.suggest(1)[0]
                 cand = validate_params(cand_raw)
