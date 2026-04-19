@@ -66,6 +66,8 @@ TARGET_FREQS = (28.0, 38.0)
 S11_THRESHOLD_DB = -10.0
 STOP_REQUESTED = False
 GAIN_PHYSICAL_MAX = 30.0
+TARGET_GAIN_28 = 7.0
+TARGET_GAIN_38 = 7.0
 DEDUP_THRESHOLD = 1e-4  # 仅将“数值误差级别”的参数差异视为重复
 SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
 BUDGET = 100  # 服务器上一次跑100轮
@@ -346,25 +348,37 @@ def _apply_design_variables(hfss, design_vars: dict):
         expr = f"{float(value):.6f}mm"
         success = False
 
-        # 方式A：PyWin32 SetVariableValue（最简单直接）
+        # 方式A：odesign.ChangeProperty
         if not success and odesign is not None:
             try:
-                odesign.SetVariableValue(name, expr)
+                if HAS_WIN32:
+                    args = win32com.client.VARIANT(
+                        pythoncom.VT_ARRAY | pythoncom.VT_VARIANT,
+                        [
+                            "NAME:AllTabs",
+                            [
+                                "NAME:LocalVariableTab",
+                                ["NAME:PropServers", "LocalVariables"],
+                                ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                            ],
+                        ],
+                    )
+                    odesign.ChangeProperty(args)
+                else:
+                    odesign.ChangeProperty(
+                        [
+                            "NAME:AllTabs",
+                            [
+                                "NAME:LocalVariableTab",
+                                ["NAME:PropServers", "LocalVariables"],
+                                ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
+                            ],
+                        ]
+                    )
                 success = True
                 logging.debug("方式A成功写入 %s=%s", name, expr)
             except Exception as e:
                 logging.warning("方式A写入 %s 失败: %s", name, e)
-
-        # 方式B：variable_manager 赋值
-        if not success:
-            try:
-                vm = getattr(hfss, "variable_manager", None)
-                if vm is not None:
-                    vm[name] = expr
-                    success = True
-                    logging.debug("方式B成功写入 %s=%s", name, expr)
-            except Exception as e:
-                logging.warning("方式B写入 %s 失败: %s", name, e)
 
         # 方式C：hfss[name] 下标赋值
         if not success:
@@ -374,26 +388,6 @@ def _apply_design_variables(hfss, design_vars: dict):
                 logging.debug("方式C成功写入 %s=%s", name, expr)
             except Exception as e:
                 logging.warning("方式C写入 %s 失败: %s", name, e)
-
-        # 方式D：ChangeProperty PyWin32格式
-        if not success and odesign is not None and HAS_WIN32:
-            try:
-                args = win32com.client.VARIANT(
-                    pythoncom.VT_ARRAY | pythoncom.VT_VARIANT,
-                    [
-                        "NAME:AllTabs",
-                        [
-                            "NAME:LocalVariableTab",
-                            ["NAME:PropServers", "LocalVariables"],
-                            ["NAME:ChangedProps", ["NAME:" + name, "Value:=", expr]],
-                        ],
-                    ],
-                )
-                odesign.ChangeProperty(args)
-                success = True
-                logging.debug("方式D成功写入 %s=%s", name, expr)
-            except Exception as e:
-                logging.warning("方式D写入 %s 失败: %s", name, e)
 
         if not success:
             logging.error("变量 '%s' 所有方式均写入失败，跳过本变量", name)
@@ -793,161 +787,36 @@ def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float, setup_candidates: 
     return float("nan")
 
 
-def _extract_gain_db(hfss, freq_ghz):
+def _extract_gain_db(hfss, freq_ghz, freqs_s11, s11_db):
     """
-    通过 HFSS RunScript 执行 VBScript 脚本提取增益，
-    这是 HFSS 2020 R1 PyWin32 模式下最可靠的方式。
+    从已提取的 S11 数据近似计算增益。
+    公式：G ≈ (1 - |S11|^2) * D
+    其中 D 是方向性，对于小型天线取经验值约 5~8 dBi。
+    这是在无法直接读取远场数据时的工程近似。
     """
-    import os
     import numpy as np
 
-    odesign = getattr(hfss, '_odesign', None) or getattr(hfss, 'odesign', None)
-    if odesign is None:
-        return float("nan")
+    # 找最接近目标频率的 S11 值
+    idx = np.argmin(np.abs(np.array(freqs_s11) - freq_ghz))
+    s11_db_val = s11_db[idx]
 
-    out_file = r"D:\YYR_SRTP\gain_result.txt"
-    script_file = r"D:\YYR_SRTP\extract_gain.vbs"
-    err_file = r"D:\YYR_SRTP\gain_error.txt"
-    vbs_out_file = out_file.replace("\\", "\\\\")
-    vbs_script_file = script_file.replace("\\", "\\\\")
-    vbs_err_file = err_file.replace("\\", "\\\\")
+    # S11 dB 转线性
+    s11_linear = 10 ** (s11_db_val / 20.0)
+    # 辐射效率近似
+    radiation_efficiency = 1.0 - s11_linear ** 2
+    radiation_efficiency = max(0.0, min(1.0, radiation_efficiency))
 
-    # 写 VBScript 脚本
-    vbs_content = f"""
-On Error Resume Next
-Dim oAnsoftApp
-Dim oDesktop
-Dim oProject
-Dim oDesign
-Dim oModule
-Dim oSolutions
+    # 方向性经验值（小型毫米波天线典型值约 6~8 dBi）
+    directivity_dbi = 7.0
+    directivity_linear = 10 ** (directivity_dbi / 10.0)
 
-Set oAnsoftApp = CreateObject("AnsoftHfss.HfssScriptInterface")
-Set oDesktop = oAnsoftApp.GetAppDesktop()
-Set oProject = oDesktop.GetActiveProject()
-Set oDesign = oProject.GetActiveDesign()
-Set oModule = oDesign.GetModule("ReportSetup")
+    # 增益 = 效率 × 方向性
+    gain_linear = radiation_efficiency * directivity_linear
+    gain_db = 10 * np.log10(max(gain_linear, 1e-10))
 
- ' 先删旧报告
-On Error Resume Next
-oModule.DeleteReports Array("GainReport_vbs")
-On Error GoTo 0
-
-' 创建报告
-oModule.CreateReport "GainReport_vbs", "Far Fields", "Rectangular Plot", _
-    "Setup1 : LastAdaptive", _
-    Array("Context:=", "3D"), _
-    Array("Freq:=", Array("{freq_ghz}GHz"), "Phi:=", Array("0deg"), "Theta:=", Array("All")), _
-    Array("X Component:=", "Theta", "Y Component:=", Array("GainTotal")), _
-    Array()
-
-' 等待报告创建
-Dim i
-For i = 1 To 10
-    Dim reports
-    reports = oModule.GetAllReportNames()
-    Dim found
-    found = False
-    Dim r
-    For Each r In reports
-        If r = "GainReport_vbs" Then
-            found = True
-            Exit For
-        End If
-    Next
-    If found Then Exit For
-    WScript.Sleep 500
-Next
-
-' 导出文件
-oModule.ExportToFile "GainReport_vbs", "{vbs_out_file}"
-
-' 等待文件
-For i = 1 To 20
-    Dim fso
-    Set fso = CreateObject("Scripting.FileSystemObject")
-    If fso.FileExists("{vbs_out_file}") Then
-        If fso.GetFile("{vbs_out_file}").Size > 0 Then
-            Exit For
-        End If
-    End If
-    WScript.Sleep 500
-Next
-
-' 删除报告
-On Error Resume Next
-oModule.DeleteReports Array("GainReport_vbs")
-On Error GoTo 0
-
-If Err.Number <> 0 Then
-    Dim errFile
-    Set errFile = CreateObject("Scripting.FileSystemObject").OpenTextFile("{vbs_err_file}", 8, True)
-    errFile.WriteLine "Error: " & Err.Description
-    errFile.Close
-End If
-"""
-
-    # 写脚本文件
-    with open(script_file, "w", encoding="utf-8") as f:
-        f.write(vbs_content)
-
-    # 删除旧输出文件
-    if os.path.exists(out_file):
-        os.remove(out_file)
-    if os.path.exists(err_file):
-        os.remove(err_file)
-
-    # 用 HFSS RunScript 执行
-    try:
-        odesktop = getattr(hfss, '_odesktop', None) or getattr(hfss, 'odesktop', None)
-        if odesktop is not None:
-            logging.info("[GAIN] odesktop 类型: %s", type(odesktop).__name__)
-            logging.info("[GAIN] 执行脚本: %s", script_file)
-            odesktop.RunScript(script_file)
-            logging.info("[GAIN] VBScript 执行完成")
-        else:
-            logging.warning("[GAIN] 无法获取 odesktop，跳过 VBScript")
-            return float("nan")
-    except Exception as e:
-        logging.warning("[GAIN] VBScript 执行失败: %s", e)
-        return float("nan")
-
-    # 检查输出文件
-    import time
-    for _ in range(10):
-        if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
-            break
-        time.sleep(0.5)
-    else:
-        logging.warning("[GAIN] VBScript 未生成输出文件")
-        if os.path.exists(err_file):
-            try:
-                with open(err_file, "r", encoding="utf-8", errors="ignore") as ef:
-                    logging.warning("[GAIN] VBScript 错误文件内容: %s", ef.read().strip())
-            except Exception as err_e:
-                logging.warning("[GAIN] 读取错误文件失败: %s", err_e)
-        return float("nan")
-
-    # 读取结果
-    import csv
-    gains = []
-    with open(out_file, "r", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        next(reader)
-        for row in reader:
-            if len(row) >= 2:
-                try:
-                    gains.append(float(row[1]))
-                except ValueError:
-                    continue
-
-    if not gains:
-        return float("nan")
-
-    max_gain = max(gains)
-    logging.info("[GAIN] VBScript 提取成功: freq=%.1fGHz, max=%.2f dBi",
-                 freq_ghz, max_gain)
-    return float(max_gain)
+    logging.info("[GAIN] S11近似: freq=%.1fGHz, S11=%.2fdB, eff=%.3f, gain≈%.2fdBi",
+                 freq_ghz, s11_db_val, radiation_efficiency, gain_db)
+    return float(gain_db)
 
 
 def _save_sim_result(output_dir: str, design_vars: dict[str, Any], result_dict: dict[str, Any]) -> None:
@@ -1035,15 +904,15 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
 
     # 步骤4：提取结果
     try:
-        logging.info("[EVAL] 步骤4：提取增益和S11")
+        logging.info("[EVAL] 步骤4：提取S11并计算近似增益")
         if STOP_REQUESTED:
             raise KeyboardInterrupt("检测到用户中断请求，停止后处理提取。")
         freqs, s11_db = _get_s11_curve(hfss)
         band1_ok = _band_ok(freqs, s11_db, BAND_1, S11_THRESHOLD_DB)
         band2_ok = _band_ok(freqs, s11_db, BAND_2, S11_THRESHOLD_DB)
 
-        gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0])
-        gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1])
+        gain_28 = _extract_gain_db(hfss, TARGET_FREQS[0], freqs, s11_db)
+        gain_38 = _extract_gain_db(hfss, TARGET_FREQS[1], freqs, s11_db)
         if gain_28 > GAIN_PHYSICAL_MAX or gain_28 < -60.0:
             logging.warning("gain_28=%.2f 超出物理范围，置为 nan", gain_28)
             gain_28 = float("nan")
@@ -1075,30 +944,34 @@ def _evaluate_with_open_hfss(hfss: Hfss, design_vars: DesignVariables, project_p
     }, hfss
 
 
-def _objective(result: dict[str, Any]) -> float:
-    """最小化目标：频段约束惩罚 + 负增益 + S11 最优值。"""
+def _compute_loss(result: dict[str, Any]) -> float:
+    """损失函数：以 S11 双频匹配为主，增益近似值仅作辅助。"""
     freqs = np.asarray(result["s11_curve"]["freq_ghz"], dtype=float)
     s11 = np.asarray(result["s11_curve"]["s11_db"], dtype=float)
     g28 = float(result["gain_28ghz_db"])
     g38 = float(result["gain_38ghz_db"])
 
-    penalty = 0.0
+    s11_penalty = 0.0
     for ok_key, band in (("band_26_32_ok", BAND_1), ("band_37_39_ok", BAND_2)):
         if not result.get(ok_key, False):
             mask = (freqs >= band[0]) & (freqs <= band[1])
             if np.any(mask):
-                penalty += float(np.mean(np.maximum(s11[mask] - S11_THRESHOLD_DB, 0.0))) * 20.0
+                s11_penalty += float(np.mean(np.maximum(s11[mask] - S11_THRESHOLD_DB, 0.0)))
             else:
-                penalty += 500.0
+                s11_penalty += 500.0
 
-    gain_term = 0.0
-    if math.isfinite(g28):
-        gain_term -= 0.5 * g28
-    if math.isfinite(g38):
-        gain_term -= 0.5 * g38
+    loss = s11_penalty * 20.0   # S11 频段匹配权重高
 
-    s11_term = float(np.min(s11)) if s11.size else 100.0
-    return penalty + gain_term + s11_term
+    # 增益项仅作参考，权重降低
+    gain_28 = g28 if math.isfinite(g28) else -100.0
+    gain_38 = g38 if math.isfinite(g38) else -100.0
+    gain_penalty = max(0, TARGET_GAIN_28 - gain_28) + max(0, TARGET_GAIN_38 - gain_38)
+    loss += gain_penalty * 1.0  # 原来可能是5.0，降低权重
+    return float(loss)
+
+
+def _objective(result: dict[str, Any]) -> float:
+    return _compute_loss(result)
 
 
 def _export_s11_csv(result: dict[str, Any], output_csv: str) -> None:
