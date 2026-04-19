@@ -794,124 +794,84 @@ def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float, setup_candidates: 
 
 
 def _extract_gain_db(hfss, freq_ghz):
-    """
-    通过导出远场报告 CSV 文件提取指定频率的最大增益。
-    """
-    import csv
-    import os
-    import time
+    import os, csv, time
+    import numpy as np
 
-    odesign = getattr(hfss, "_odesign", None) or getattr(hfss, "odesign", None)
+    odesign = getattr(hfss, '_odesign', None) or getattr(hfss, 'odesign', None)
     if odesign is None:
         return float("nan")
     logging.info("[GAIN] 开始提取增益: %.1f GHz", freq_ghz)
 
     oModule = odesign.GetModule("ReportSetup")
     report_name = f"Gain_{int(freq_ghz)}GHz_opt"
-    # 使用工程文件所在目录，避免 Temp 路径问题
-    tmp_dir = EXPORT_TMP_DIR   # 使用项目目录，路径简单无空格
-    os.makedirs(tmp_dir, exist_ok=True)
-    tmp_file = os.path.join(tmp_dir, f"gain_{int(freq_ghz)}g_temp.csv")
+    tmp_file = os.path.join(r"D:\YYR_SRTP", f"gain_{int(freq_ghz)}g_temp.csv")
 
+    # 删除旧报告
     try:
         oModule.DeleteReports([report_name])
     except Exception:
         pass
 
-    # HFSS 2020 R1 远场报告格式
+    # 打印当前可用报告类型，帮助诊断
     try:
-        oModule.CreateReport(
-            report_name,
-            "Far Fields",
-            "Rectangular Plot",
-            "Setup1 : LastAdaptive",
-            [
-                "Context:=", "3D",
-                "SourceContext:=", ""
-            ],
-            [
-                "Freq:=", [f"{freq_ghz}GHz"],
-                "Phi:=", ["All"],
-                "Theta:=", ["All"]
-            ],
-            [
-                "X Component:=", "Theta",
-                "Y Component:=", ["GainTotal"]
-            ],
-            []
-        )
-        logging.info("[GAIN] 报告创建成功: %s", report_name)
-    except Exception as e1:
-        # 备用格式：去掉 SourceContext
-        try:
-            oModule.CreateReport(
-                report_name,
-                "Far Fields",
-                "Rectangular Plot",
-                "Setup1 : LastAdaptive",
-                ["Context:=", "3D"],
-                [
-                    "Freq:=", [f"{freq_ghz}GHz"],
-                    "Phi:=", ["0deg"],
-                    "Theta:=", ["All"]
-                ],
-                [
-                    "X Component:=", "Theta",
-                    "Y Component:=", ["GainTotal"]
-                ],
-                []
-            )
-            logging.info("[GAIN] 备用报告创建成功: %s", report_name)
-        except Exception as e2:
-            logging.warning("[GAIN] 两种格式均失败: %s / %s", e1, e2)
-            return float("nan")
-
-    try:
-        reports = oModule.GetAllReportNames()
-        logging.info("[GAIN] 当前所有报告: %s", list(reports))
-    except Exception:
-        pass
-
-    try:
-        logging.info("[GAIN] 开始导出到: %s", tmp_file)
-        oModule.ExportToFile(report_name, tmp_file)
-        logging.info("[GAIN] ExportToFile 调用完成，等待文件写入...")
+        report_types = oModule.GetAvailableReportTypes()
+        logging.info("[GAIN] 可用报告类型: %s", list(report_types))
     except Exception as e:
-        logging.warning("[GAIN] ExportToFile 调用失败: %s", e)
+        logging.warning("[GAIN] 无法获取报告类型: %s", e)
+
+    # 尝试创建 Antenna Parameters 类型报告（HFSS 2020 专用）
+    created = False
+    for report_type in ["Antenna Parameters", "Far Fields"]:
+        if created:
+            break
+        for context in [["Context:=", "3D"], []]:
+            try:
+                oModule.CreateReport(
+                    report_name,
+                    report_type,
+                    "Rectangular Plot",
+                    "Setup1 : LastAdaptive",
+                    context,
+                    [
+                        "Freq:=", [f"{freq_ghz}GHz"],
+                        "Phi:=", ["0deg"],
+                        "Theta:=", ["All"]
+                    ],
+                    [
+                        "X Component:=", "Theta",
+                        "Y Component:=", ["GainTotal"]
+                    ],
+                    []
+                )
+                created = True
+                logging.info("[GAIN] 报告创建成功: type=%s", report_type)
+                break
+            except Exception as e:
+                logging.warning("[GAIN] type=%s context=%s 失败: %s",
+                               report_type, context, e)
+
+    if not created:
+        logging.warning("[GAIN] 所有格式均无法创建报告")
         return float("nan")
 
-    # 等待文件出现，最多等15秒
-    for i in range(30):
+    # 导出文件
+    try:
+        oModule.ExportToFile(report_name, tmp_file)
+    except Exception as e:
+        logging.warning("[GAIN] ExportToFile 失败: %s", e)
+        try:
+            oModule.DeleteReports([report_name])
+        except Exception:
+            pass
+        return float("nan")
+
+    # 等待文件（最多5秒，不要等太长）
+    for _ in range(10):
         if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
-            logging.info("[GAIN] 文件已生成，大小=%d bytes", os.path.getsize(tmp_file))
             break
         time.sleep(0.5)
     else:
-        logging.warning("[GAIN] 等待超时15秒，文件仍未生成")
-        return float("nan")
-
-    try:
-        gains = []
-        with open(tmp_file, "r", encoding="utf-8-sig") as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            for row in reader:
-                if len(row) >= 2:
-                    try:
-                        gains.append(float(row[1]))
-                    except ValueError:
-                        continue
-
-        if not gains:
-            return float("nan")
-
-        max_gain = max(gains)
-        logging.info("增益提取成功: freq=%.1fGHz, max_gain=%.2f dBi", freq_ghz, max_gain)
-        return max_gain
-    except Exception as e:
-        logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, e)
-        return float("nan")
-    finally:
+        logging.warning("[GAIN] 文件未生成: %s", tmp_file)
         try:
             if os.path.exists(tmp_file):
                 os.remove(tmp_file)
@@ -921,6 +881,35 @@ def _extract_gain_db(hfss, freq_ghz):
             oModule.DeleteReports([report_name])
         except Exception:
             pass
+        return float("nan")
+
+    # 读取 CSV
+    try:
+        oModule.DeleteReports([report_name])
+    except Exception:
+        pass
+
+    gains = []
+    with open(tmp_file, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        next(reader)  # 跳过表头
+        for row in reader:
+            if len(row) >= 2:
+                try:
+                    gains.append(float(row[1]))
+                except ValueError:
+                    continue
+    try:
+        os.remove(tmp_file)
+    except Exception:
+        pass
+
+    if not gains:
+        return float("nan")
+
+    max_gain = max(gains)
+    logging.info("[GAIN] freq=%.1fGHz, max_gain=%.2f dBi", freq_ghz, max_gain)
+    return max_gain
 
 
 def _save_sim_result(output_dir: str, design_vars: dict[str, Any], result_dict: dict[str, Any]) -> None:
