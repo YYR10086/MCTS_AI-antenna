@@ -795,62 +795,106 @@ def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float, setup_candidates: 
 
 def _extract_gain_db(hfss, freq_ghz):
     """
-    直接用 HFSS COM 接口 GetSolutionDataEx 读取远场增益，
-    完全不依赖 ExportToFile，兼容 HFSS 2020 R1 PyWin32 模式。
+    通过 HFSS RunScript 执行 VBScript 脚本提取增益，
+    这是 HFSS 2020 R1 PyWin32 模式下最可靠的方式。
     """
+    import os
     import numpy as np
 
     odesign = getattr(hfss, '_odesign', None) or getattr(hfss, 'odesign', None)
     if odesign is None:
         return float("nan")
-    logging.info("[GAIN] 开始提取增益: %.1f GHz", freq_ghz)
 
+    out_file = r"D:\YYR_SRTP\gain_result.txt"
+    script_file = r"D:\YYR_SRTP\extract_gain.vbs"
+
+    # 写 VBScript 脚本
+    vbs_content = f"""
+Dim oAnsoftApp
+Dim oDesktop
+Dim oProject
+Dim oDesign
+Dim oModule
+Dim oReportData
+
+Set oAnsoftApp = CreateObject("AnsoftHfss.HfssScriptInterface")
+Set oDesktop = oAnsoftApp.GetAppDesktop()
+Set oProject = oDesktop.GetActiveProject()
+Set oDesign = oProject.GetActiveDesign()
+Set oModule = oDesign.GetModule("ReportSetup")
+
+Dim sSetup
+sSetup = "Setup1 : LastAdaptive"
+
+Dim sFreq
+sFreq = "{freq_ghz}GHz"
+
+' 创建远场报告
+oModule.CreateReport "GainReport_vbs", "Far Fields", "Rectangular Plot", _
+    sSetup, _
+    Array("Context:=", "3D"), _
+    Array("Freq:=", Array(sFreq), "Phi:=", Array("0deg"), "Theta:=", Array("All")), _
+    Array("X Component:=", "Theta", "Y Component:=", Array("GainTotal")), _
+    Array()
+
+' 导出
+oModule.ExportToFile "GainReport_vbs", "{out_file}"
+
+' 删除报告
+oModule.DeleteReports Array("GainReport_vbs")
+"""
+
+    # 写脚本文件
+    with open(script_file, "w", encoding="utf-8") as f:
+        f.write(vbs_content)
+
+    # 删除旧输出文件
+    if os.path.exists(out_file):
+        os.remove(out_file)
+
+    # 用 HFSS RunScript 执行
     try:
-        oModule = odesign.GetModule("Solutions")
-
-        # 获取远场数据：在指定频率下扫描 Theta，Phi=0
-        data = oModule.GetSolutionDataEx(
-            "Setup1 : LastAdaptive",
-            "GainTotal",
-            ["Freq:=", [f"{freq_ghz}GHz"],
-             "Phi:=", ["0deg"],
-             "Theta:=", ["All"]]
-        )
-        gains = list(data)
-        if not gains:
+        odesktop = getattr(hfss, '_odesktop', None) or getattr(hfss, 'odesktop', None)
+        if odesktop is not None:
+            odesktop.RunScript(script_file)
+            logging.info("[GAIN] VBScript 执行完成")
+        else:
+            logging.warning("[GAIN] 无法获取 odesktop，跳过 VBScript")
             return float("nan")
-        max_gain = max(gains)
-        logging.info("[GAIN] GetSolutionDataEx 成功: freq=%.1fGHz, max=%.2f dBi",
-                     freq_ghz, max_gain)
-        return float(max_gain)
-
     except Exception as e:
-        logging.warning("[GAIN] GetSolutionDataEx 失败: %s", e)
+        logging.warning("[GAIN] VBScript 执行失败: %s", e)
+        return float("nan")
 
-    # 备用方式：用 CalcStack 计算远场
-    try:
-        oModule2 = odesign.GetModule("FieldsReporter")
-        oModule2.CalcStack("clear")
-        oModule2.EnterQty("GainTotal")
-        oModule2.CalcOp("Smooth")
-        oModule2.EnterQty("GainTotal")
-        oModule2.CalcOp("Maximum")
-        result = oModule2.GetTopEntryValue(
-            "Setup1 : LastAdaptive",
-            ["Freq:=", f"{freq_ghz}GHz",
-             "Phi:=", "0deg",
-             "Theta:=", "0deg"]
-        )
-        max_gain = float(result[0])
-        logging.info("[GAIN] FieldsReporter 成功: freq=%.1fGHz, max=%.2f dBi",
-                     freq_ghz, max_gain)
-        return max_gain
-    except Exception as e2:
-        logging.warning("[GAIN] FieldsReporter 失败: %s", e2)
+    # 检查输出文件
+    import time
+    for _ in range(10):
+        if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+            break
+        time.sleep(0.5)
+    else:
+        logging.warning("[GAIN] VBScript 未生成输出文件")
+        return float("nan")
 
-    # 备用方式2：直接读 S 参数后用公式近似（临时方案）
-    logging.warning("[GAIN] 所有增益提取方式均失败，返回 nan")
-    return float("nan")
+    # 读取结果
+    import csv
+    gains = []
+    with open(out_file, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            if len(row) >= 2:
+                try:
+                    gains.append(float(row[1]))
+                except ValueError:
+                    continue
+
+    if not gains:
+        return float("nan")
+
+    max_gain = max(gains)
+    logging.info("[GAIN] VBScript 提取成功: freq=%.1fGHz, max=%.2f dBi",
+                 freq_ghz, max_gain)
+    return float(max_gain)
 
 
 def _save_sim_result(output_dir: str, design_vars: dict[str, Any], result_dict: dict[str, Any]) -> None:
