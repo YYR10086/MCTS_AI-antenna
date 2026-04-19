@@ -869,55 +869,10 @@ def _extract_gain_db(hfss, freq_ghz):
         else:
             raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
 
-        try:
-            # 创建远场增益报告，固定频率，扫描 Theta
-            oModule.CreateReport(
-                report_name,
-                "Far Fields",
-                "Rectangular Plot",
-                setup_sweep_name,
-                [
-                    "Context:=", "3D"
-                ],
-                [
-                    "Freq:=", [f"{freq_ghz}GHz"],
-                    "Phi:=", ["0deg"],
-                    "Theta:=", ["All"]
-                ],
-                ["X Component:=", "Theta",
-                 "Y Component:=", ["GainTotal"]],
-                []
-            )
-
-            oModule.ExportToFile(report_name, tmp_file)
-            for _ in range(10):
-                if os.path.exists(tmp_file):
-                    break
-                time.sleep(0.5)
-            else:
-                raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
-
-            logging.info("[GAIN] 使用 setup_sweep='%s' 导出成功", setup_sweep_name)
-            report_ok = True
-            break
-        except Exception as e:
-            last_exc = e
-            logging.warning("[GAIN] setup_sweep='%s' 失败: %s", setup_sweep_name, e)
-        finally:
-            try:
-                oModule.DeleteReports([report_name])
-            except Exception:
-                pass
-
-    if not report_ok:
-        logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, last_exc)
-        return float("nan")
-
-    try:
         gains = []
         with open(tmp_file, "r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
-            next(reader)
+            next(reader, None)
             for row in reader:
                 if len(row) >= 2:
                     try:
@@ -925,22 +880,21 @@ def _extract_gain_db(hfss, freq_ghz):
                     except ValueError:
                         continue
 
-        try:
-            os.remove(tmp_file)
-        except Exception:
-            pass
-
         if not gains:
             return float("nan")
 
         max_gain = max(gains)
         logging.info("增益提取成功: freq=%.1fGHz, max_gain=%.2f dBi", freq_ghz, max_gain)
         return max_gain
-
     except Exception as e:
         logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, e)
         return float("nan")
     finally:
+        try:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        except Exception:
+            pass
         try:
             oModule.DeleteReports([report_name])
         except Exception:
