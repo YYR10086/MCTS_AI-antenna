@@ -794,7 +794,10 @@ def _extract_gain_db_once(hfss: Hfss, target_freq_ghz: float, setup_candidates: 
 
 
 def _extract_gain_db(hfss, freq_ghz):
-    import os, csv, time
+    """
+    直接用 HFSS COM 接口 GetSolutionDataEx 读取远场增益，
+    完全不依赖 ExportToFile，兼容 HFSS 2020 R1 PyWin32 模式。
+    """
     import numpy as np
 
     odesign = getattr(hfss, '_odesign', None) or getattr(hfss, 'odesign', None)
@@ -802,110 +805,52 @@ def _extract_gain_db(hfss, freq_ghz):
         return float("nan")
     logging.info("[GAIN] 开始提取增益: %.1f GHz", freq_ghz)
 
-    oModule = odesign.GetModule("ReportSetup")
-    report_name = f"Gain_{int(freq_ghz)}GHz_opt"
-    tmp_file = os.path.join(r"D:\YYR_SRTP", f"gain_{int(freq_ghz)}g_temp.csv")
-
-    # 删除旧报告
     try:
-        oModule.DeleteReports([report_name])
-    except Exception:
-        pass
+        oModule = odesign.GetModule("Solutions")
 
-    # 打印当前可用报告类型，帮助诊断
-    try:
-        report_types = oModule.GetAvailableReportTypes()
-        logging.info("[GAIN] 可用报告类型: %s", list(report_types))
+        # 获取远场数据：在指定频率下扫描 Theta，Phi=0
+        data = oModule.GetSolutionDataEx(
+            "Setup1 : LastAdaptive",
+            "GainTotal",
+            ["Freq:=", [f"{freq_ghz}GHz"],
+             "Phi:=", ["0deg"],
+             "Theta:=", ["All"]]
+        )
+        gains = list(data)
+        if not gains:
+            return float("nan")
+        max_gain = max(gains)
+        logging.info("[GAIN] GetSolutionDataEx 成功: freq=%.1fGHz, max=%.2f dBi",
+                     freq_ghz, max_gain)
+        return float(max_gain)
+
     except Exception as e:
-        logging.warning("[GAIN] 无法获取报告类型: %s", e)
+        logging.warning("[GAIN] GetSolutionDataEx 失败: %s", e)
 
+    # 备用方式：用 CalcStack 计算远场
     try:
-        quantities = oModule.GetAvailableQuantities("Antenna Parameters",
-                                                     "Rectangular Plot",
-                                                     "3D",
-                                                     "Setup1 : LastAdaptive")
-        logging.info("[GAIN] Antenna Parameters 可用变量: %s", list(quantities))
-    except Exception as e:
-        logging.warning("[GAIN] 无法查询变量: %s", e)
+        oModule2 = odesign.GetModule("FieldsReporter")
+        oModule2.CalcStack("clear")
+        oModule2.EnterQty("GainTotal")
+        oModule2.CalcOp("Smooth")
+        oModule2.EnterQty("GainTotal")
+        oModule2.CalcOp("Maximum")
+        result = oModule2.GetTopEntryValue(
+            "Setup1 : LastAdaptive",
+            ["Freq:=", f"{freq_ghz}GHz",
+             "Phi:=", "0deg",
+             "Theta:=", "0deg"]
+        )
+        max_gain = float(result[0])
+        logging.info("[GAIN] FieldsReporter 成功: freq=%.1fGHz, max=%.2f dBi",
+                     freq_ghz, max_gain)
+        return max_gain
+    except Exception as e2:
+        logging.warning("[GAIN] FieldsReporter 失败: %s", e2)
 
-    try:
-        quantities2 = oModule.GetAvailableQuantities("Far Fields",
-                                                      "Rectangular Plot",
-                                                      "3D",
-                                                      "Setup1 : LastAdaptive")
-        logging.info("[GAIN] Far Fields 可用变量: %s", list(quantities2))
-    except Exception as e:
-        logging.warning("[GAIN] Far Fields 变量查询失败: %s", e)
-    gain_quantities_to_try = [
-        "GainTotal",
-        "dBGainTotal",
-        "Gain",
-        "RealizedGain",
-        "Peak Realized Gain",
-        "Peak Gain",
-    ]
-
-    for qty in gain_quantities_to_try:
-        try:
-            oModule.DeleteReports([report_name])
-        except Exception:
-            pass
-        try:
-            oModule.CreateReport(
-                report_name,
-                "Antenna Parameters",
-                "Rectangular Plot",
-                "Setup1 : LastAdaptive",
-                [],
-                [
-                    "Freq:=", [f"{freq_ghz}GHz"],
-                    "Phi:=", ["0deg"],
-                    "Theta:=", ["All"]
-                ],
-                [
-                    "X Component:=", "Theta",
-                    "Y Component:=", [qty]
-                ],
-                []
-            )
-            oModule.ExportToFile(report_name, tmp_file)
-            time.sleep(2)
-            if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
-                logging.info("[GAIN] 成功: qty=%s", qty)
-                break
-            logging.warning("[GAIN] qty=%s 文件未生成", qty)
-        except Exception as e:
-            logging.warning("[GAIN] qty=%s 失败: %s", qty, e)
-    else:
-        return float("nan")
-
-    # 读取 CSV
-    try:
-        oModule.DeleteReports([report_name])
-    except Exception:
-        pass
-
-    gains = []
-    with open(tmp_file, "r", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        next(reader)  # 跳过表头
-        for row in reader:
-            if len(row) >= 2:
-                try:
-                    gains.append(float(row[1]))
-                except ValueError:
-                    continue
-    try:
-        os.remove(tmp_file)
-    except Exception:
-        pass
-
-    if not gains:
-        return float("nan")
-
-    max_gain = max(gains)
-    logging.info("[GAIN] freq=%.1fGHz, max_gain=%.2f dBi", freq_ghz, max_gain)
-    return max_gain
+    # 备用方式2：直接读 S 参数后用公式近似（临时方案）
+    logging.warning("[GAIN] 所有增益提取方式均失败，返回 nan")
+    return float("nan")
 
 
 def _save_sim_result(output_dir: str, design_vars: dict[str, Any], result_dict: dict[str, Any]) -> None:
