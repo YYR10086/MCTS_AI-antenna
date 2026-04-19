@@ -71,6 +71,7 @@ SESSION_REFRESH_INTERVAL = 10  # 每 N 轮主动重建一次 HFSS 会话
 BUDGET = 100  # 服务器上一次跑100轮
 _DIAG_PRINTED = False
 _first_analyze_done = False
+EXPORT_TMP_DIR = r"D:\YYR_SRTP"
 
 API_CONFIG = {
     "W": {"type": "real", "space": "linear", "range": (12.0, 20.0)},
@@ -543,7 +544,7 @@ def _safe_release(hfss):
 
 
 def _get_s11_curve(hfss):
-    import numpy as np, csv, tempfile, os
+    import numpy as np, csv, os
 
     odesign = getattr(hfss, '_odesign', None) or getattr(hfss, 'odesign', None)
     if odesign is None:
@@ -551,7 +552,9 @@ def _get_s11_curve(hfss):
 
     oModule = odesign.GetModule("ReportSetup")
     report_name = "S11_opt_report"
-    tmp_file = os.path.join(tempfile.gettempdir(), "hfss_s11_export.csv")
+    tmp_dir = EXPORT_TMP_DIR
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_file = os.path.join(tmp_dir, "s11_temp.csv")
 
     # 删除旧报告
     try:
@@ -795,7 +798,6 @@ def _extract_gain_db(hfss, freq_ghz):
     通过导出远场报告 CSV 文件提取指定频率的最大增益。
     """
     import csv
-    import tempfile
     import os
     import time
 
@@ -806,7 +808,10 @@ def _extract_gain_db(hfss, freq_ghz):
 
     oModule = odesign.GetModule("ReportSetup")
     report_name = f"Gain_{int(freq_ghz)}GHz_opt"
-    tmp_file = os.path.join(tempfile.gettempdir(), f"hfss_gain_{int(freq_ghz)}g.csv")
+    # 使用工程文件所在目录，避免 Temp 路径问题
+    tmp_dir = EXPORT_TMP_DIR   # 使用项目目录，路径简单无空格
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_file = os.path.join(tmp_dir, f"gain_{int(freq_ghz)}g_temp.csv")
 
     try:
         oModule.DeleteReports([report_name])
@@ -862,14 +867,30 @@ def _extract_gain_db(hfss, freq_ghz):
             return float("nan")
 
     try:
-        oModule.ExportToFile(report_name, tmp_file)
-        for _ in range(10):
-            if os.path.exists(tmp_file):
-                break
-            time.sleep(0.5)
-        else:
-            raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
+        reports = oModule.GetAllReportNames()
+        logging.info("[GAIN] 当前所有报告: %s", list(reports))
+    except Exception:
+        pass
 
+    try:
+        logging.info("[GAIN] 开始导出到: %s", tmp_file)
+        oModule.ExportToFile(report_name, tmp_file)
+        logging.info("[GAIN] ExportToFile 调用完成，等待文件写入...")
+    except Exception as e:
+        logging.warning("[GAIN] ExportToFile 调用失败: %s", e)
+        return float("nan")
+
+    # 等待文件出现，最多等15秒
+    for i in range(30):
+        if os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 0:
+            logging.info("[GAIN] 文件已生成，大小=%d bytes", os.path.getsize(tmp_file))
+            break
+        time.sleep(0.5)
+    else:
+        logging.warning("[GAIN] 等待超时15秒，文件仍未生成")
+        return float("nan")
+
+    try:
         gains = []
         with open(tmp_file, "r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
