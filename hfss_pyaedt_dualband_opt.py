@@ -631,7 +631,7 @@ def _get_s11_curve(hfss):
     if not freqs:
         raise RuntimeError("S11 CSV 文件为空")
 
-    freqs = np.array(freqs) / 1e9
+    freqs = np.array(freqs)  # CSV 里已经是 GHz，不需要再转换
     s11_vals = np.array(s11_vals)
     logging.info("[S11] 提取成功，%d 个频率点，%.1f~%.1f GHz",
                  len(freqs), freqs[0], freqs[-1])
@@ -812,20 +812,62 @@ def _extract_gain_db(hfss, freq_ghz):
     except Exception:
         pass
 
-    setup_sweep_candidates = [
-        "Setup1 : LastAdaptive",
-        "Setup1 : Sweep",
-        "Setup1",
-    ]
-    report_ok = False
-    last_exc = None
-
-    for setup_sweep_name in setup_sweep_candidates:
+    # HFSS 2020 R1 远场报告格式
+    try:
+        oModule.CreateReport(
+            report_name,
+            "Far Fields",
+            "Rectangular Plot",
+            "Setup1 : LastAdaptive",
+            [
+                "Context:=", "3D",
+                "SourceContext:=", ""
+            ],
+            [
+                "Freq:=", [f"{freq_ghz}GHz"],
+                "Phi:=", ["All"],
+                "Theta:=", ["All"]
+            ],
+            [
+                "X Component:=", "Theta",
+                "Y Component:=", ["GainTotal"]
+            ],
+            []
+        )
+        logging.info("[GAIN] 报告创建成功: %s", report_name)
+    except Exception as e1:
+        # 备用格式：去掉 SourceContext
         try:
+            oModule.CreateReport(
+                report_name,
+                "Far Fields",
+                "Rectangular Plot",
+                "Setup1 : LastAdaptive",
+                ["Context:=", "3D"],
+                [
+                    "Freq:=", [f"{freq_ghz}GHz"],
+                    "Phi:=", ["0deg"],
+                    "Theta:=", ["All"]
+                ],
+                [
+                    "X Component:=", "Theta",
+                    "Y Component:=", ["GainTotal"]
+                ],
+                []
+            )
+            logging.info("[GAIN] 备用报告创建成功: %s", report_name)
+        except Exception as e2:
+            logging.warning("[GAIN] 两种格式均失败: %s / %s", e1, e2)
+            return float("nan")
+
+    try:
+        oModule.ExportToFile(report_name, tmp_file)
+        for _ in range(10):
             if os.path.exists(tmp_file):
-                os.remove(tmp_file)
-        except Exception:
-            pass
+                break
+            time.sleep(0.5)
+        else:
+            raise FileNotFoundError(f"等待超时，文件未生成: {tmp_file}")
 
         try:
             # 创建远场增益报告，固定频率，扫描 Theta
@@ -898,6 +940,11 @@ def _extract_gain_db(hfss, freq_ghz):
     except Exception as e:
         logging.warning("增益提取失败 freq=%.1fGHz: %s", freq_ghz, e)
         return float("nan")
+    finally:
+        try:
+            oModule.DeleteReports([report_name])
+        except Exception:
+            pass
 
 
 def _save_sim_result(output_dir: str, design_vars: dict[str, Any], result_dict: dict[str, Any]) -> None:
