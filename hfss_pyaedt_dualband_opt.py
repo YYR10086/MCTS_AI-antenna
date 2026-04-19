@@ -807,15 +807,20 @@ def _extract_gain_db(hfss, freq_ghz):
 
     out_file = r"D:\YYR_SRTP\gain_result.txt"
     script_file = r"D:\YYR_SRTP\extract_gain.vbs"
+    err_file = r"D:\YYR_SRTP\gain_error.txt"
+    vbs_out_file = out_file.replace("\\", "\\\\")
+    vbs_script_file = script_file.replace("\\", "\\\\")
+    vbs_err_file = err_file.replace("\\", "\\\\")
 
     # 写 VBScript 脚本
     vbs_content = f"""
+On Error Resume Next
 Dim oAnsoftApp
 Dim oDesktop
 Dim oProject
 Dim oDesign
 Dim oModule
-Dim oReportData
+Dim oSolutions
 
 Set oAnsoftApp = CreateObject("AnsoftHfss.HfssScriptInterface")
 Set oDesktop = oAnsoftApp.GetAppDesktop()
@@ -823,25 +828,63 @@ Set oProject = oDesktop.GetActiveProject()
 Set oDesign = oProject.GetActiveDesign()
 Set oModule = oDesign.GetModule("ReportSetup")
 
-Dim sSetup
-sSetup = "Setup1 : LastAdaptive"
+ ' 先删旧报告
+On Error Resume Next
+oModule.DeleteReports Array("GainReport_vbs")
+On Error GoTo 0
 
-Dim sFreq
-sFreq = "{freq_ghz}GHz"
-
-' 创建远场报告
+' 创建报告
 oModule.CreateReport "GainReport_vbs", "Far Fields", "Rectangular Plot", _
-    sSetup, _
+    "Setup1 : LastAdaptive", _
     Array("Context:=", "3D"), _
-    Array("Freq:=", Array(sFreq), "Phi:=", Array("0deg"), "Theta:=", Array("All")), _
+    Array("Freq:=", Array("{freq_ghz}GHz"), "Phi:=", Array("0deg"), "Theta:=", Array("All")), _
     Array("X Component:=", "Theta", "Y Component:=", Array("GainTotal")), _
     Array()
 
-' 导出
-oModule.ExportToFile "GainReport_vbs", "{out_file}"
+' 等待报告创建
+Dim i
+For i = 1 To 10
+    Dim reports
+    reports = oModule.GetAllReportNames()
+    Dim found
+    found = False
+    Dim r
+    For Each r In reports
+        If r = "GainReport_vbs" Then
+            found = True
+            Exit For
+        End If
+    Next
+    If found Then Exit For
+    WScript.Sleep 500
+Next
+
+' 导出文件
+oModule.ExportToFile "GainReport_vbs", "{vbs_out_file}"
+
+' 等待文件
+For i = 1 To 20
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FileExists("{vbs_out_file}") Then
+        If fso.GetFile("{vbs_out_file}").Size > 0 Then
+            Exit For
+        End If
+    End If
+    WScript.Sleep 500
+Next
 
 ' 删除报告
+On Error Resume Next
 oModule.DeleteReports Array("GainReport_vbs")
+On Error GoTo 0
+
+If Err.Number <> 0 Then
+    Dim errFile
+    Set errFile = CreateObject("Scripting.FileSystemObject").OpenTextFile("{vbs_err_file}", 8, True)
+    errFile.WriteLine "Error: " & Err.Description
+    errFile.Close
+End If
 """
 
     # 写脚本文件
@@ -851,11 +894,15 @@ oModule.DeleteReports Array("GainReport_vbs")
     # 删除旧输出文件
     if os.path.exists(out_file):
         os.remove(out_file)
+    if os.path.exists(err_file):
+        os.remove(err_file)
 
     # 用 HFSS RunScript 执行
     try:
         odesktop = getattr(hfss, '_odesktop', None) or getattr(hfss, 'odesktop', None)
         if odesktop is not None:
+            logging.info("[GAIN] odesktop 类型: %s", type(odesktop).__name__)
+            logging.info("[GAIN] 执行脚本: %s", script_file)
             odesktop.RunScript(script_file)
             logging.info("[GAIN] VBScript 执行完成")
         else:
@@ -873,6 +920,12 @@ oModule.DeleteReports Array("GainReport_vbs")
         time.sleep(0.5)
     else:
         logging.warning("[GAIN] VBScript 未生成输出文件")
+        if os.path.exists(err_file):
+            try:
+                with open(err_file, "r", encoding="utf-8", errors="ignore") as ef:
+                    logging.warning("[GAIN] VBScript 错误文件内容: %s", ef.read().strip())
+            except Exception as err_e:
+                logging.warning("[GAIN] 读取错误文件失败: %s", err_e)
         return float("nan")
 
     # 读取结果
